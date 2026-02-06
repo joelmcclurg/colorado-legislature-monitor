@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""
+Bills scraper for Colorado Legislature.
+
+Fetches and parses bill information from colorado.leg.gov including:
+- Bill listings with filtering by session, chamber, type
+- Detailed bill information (sponsors, committees, status)
+- Bill text versions, amendments, fiscal notes
+- Vote history
+"""
+import re
+import requests
+from bs4 import BeautifulSoup
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+from .sessions import get_current_session
+from .pdf_extractor import extract_pdf_text, batch_extract_pdfs
+
+
+BASE_URL = "https://leg.colorado.gov"
+BILLS_SEARCH_URL = f"{BASE_URL}/bills/bill-search"
+
+
+def list_bills(
+    session: Optional[str] = None,
+    chamber: Optional[str] = None,
+    bill_type: Optional[str] = None,
+    sponsor: Optional[str] = None,
+    subject: Optional[str] = None,
+    limit: int = 100,
+    cache_manager=None
+) -> List[Dict[str, Any]]:
+    """
+    List bills with optional filtering.
+
+    Args:
+        session: Session code (e.g., '2026A'). Defaults to current session.
+        chamber: Filter by chamber ('House', 'Senate', or None for all)
+        bill_type: Filter by type ('Bill', 'Resolution', 'Memorial', or None)
+        sponsor: Filter by sponsor name
+        subject: Filter by subject/topic
+        limit: Maximum number of bills to return (default 100)
+        cache_manager: Optional cache manager instance
+
+    Returns:
+        List of bill dicts with basic information
+    """
+    if not session:
+        session = get_current_session()
+
+    # Check cache
+    cache_key = f"bills_list_{session}_{chamber}_{bill_type}_{limit}"
+    if cache_manager:
+        cached = cache_manager.get(cache_key, max_age_hours=6)
+        if cached:
+            return cached
+
+    # Fetch main bills page
+    # The search interface uses dynamic loading, so we scrape from the main bills page
+    url = f"{BASE_URL}/bills"
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        raise Exception(f"Failed to fetch bills: {e}")
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    # Find all bill links
+    # Extract year suffix from session (2026A -> 26)
+    # Session format is usually YYYYA where YYYY is the year
+    if session and len(session) >= 4:
+        year_suffix = session[2:4]  # "2026A" -> "26"
+    else:
+        year_suffix = '26'
+
+    bills = []
+    # Pattern: /bills/hb26-1001 or /bills/sb26-004 or /bills/hjr26-001, etc.
+    bill_links = soup.find_all('a', href=re.compile(rf'/bills/[hs][bcjm][rm]?{year_suffix}-\d+', re.I))
+
+    for link in bill_links:
+        bill_url = link.get('href', '')
+        if not bill_url:
+            continue
+
+        # Extract bill number from URL
+        bill_match = re.search(r'([hs][bcjm][rm]?\d+-\d+)', bill_url, re.I)
+        if not bill_match:
+            continue
+
+        bill_number = bill_match.group(1).upper()
+
+        # Apply chamber filter
+        if chamber:
+            if chamber == 'House' and not bill_number.startswith('H'):
+                continue
+            elif chamber == 'Senate' and not bill_number.startswith('S'):
+                continue
+
+        # Get bill title from link text or nearby text
+        title = link.text.strip()
+        # Remove bill number from title if present
+        title = re.sub(r'^[HS][BCRJM]+\d+-\d+\s*', '', title, flags=re.I)
+
+        # Check for duplicates
+        if any(b['bill_number'] == bill_number for b in bills):
+            continue
+
+        bills.append({
+            'bill_number': bill_number,
+            'title': title if title else None,
+            'url': f"{BASE_URL}{bill_url}" if bill_url.startswith('/') else bill_url,
+            'last_action': None,
+            'subjects': [],
+            'sponsors': []
+        })
+
+        # Stop if we've hit the limit
+        if len(bills) >= limit:
+            break
+
+    # Cache result
+    if cache_manager:
+        cache_manager.set(cache_key, bills, subdirectory='bills')
+
+    return bills
+
+
+def get_bill_info(
+    bill_number: str,
+    session: Optional[str] = None,
+    cache_manager=None,
+    extract_content=False,
+    progress_callback=None
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch detailed information for a specific bill.
+
+    Args:
+        bill_number: Bill number (e.g., 'HB26-1001', 'SB26-004')
+        session: Session code (e.g., '2026A'). Used for cache key.
+        cache_manager: Optional cache manager instance
+        extract_content: If True, extract PDF content for bill text/amendments
+        progress_callback: Optional callback(completed, total, url, from_cache) for progress
+
+    Returns:
+        Dict with bill details including sponsors, status, amendments, votes
+    """
+    if not session:
+        session = get_current_session()
+
+    # Normalize bill number to lowercase for URL
+    bill_slug = bill_number.lower()
+
+    # Check cache
+    cache_key = f"bill_{bill_slug}_{session}"
+    if cache_manager:
+        cached = cache_manager.get(cache_key, max_age_hours=6)
+        if cached:
+            return cached
+
+    # Fetch bill page
+    url = f"{BASE_URL}/bills/{bill_slug}"
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        raise Exception(f"Failed to fetch bill page: {e}")
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    # Extract bill information
+    bill_info = {
+        'bill_number': bill_number.upper(),
+        'session': session,
+        'url': url,
+        'title': None,
+        'long_title': None,
+        'status': None,
+        'sponsors': [],
+        'committee': None,
+        'subjects': [],
+        'last_action': None,
+        'bill_text': [],
+        'fiscal_notes': [],
+        'amendments': [],
+        'votes': [],
+        'history': [],
+        'fetched_at': datetime.now().isoformat()
+    }
+
+    # Extract title
+    title_elem = soup.find('h1')
+    if title_elem:
+        # Remove bill number from title
+        title_text = title_elem.text.strip()
+        title_text = re.sub(r'^[HS][BCJM][JR]*\d+-\d+\s*', '', title_text)
+        bill_info['title'] = title_text
+
+    # Extract long title
+    long_title_elem = soup.find('div', class_=re.compile(r'long.*title'))
+    if long_title_elem:
+        bill_info['long_title'] = long_title_elem.text.strip()
+
+    # Extract status from the status badge (most reliable)
+    status_badge = soup.find('div', class_=re.compile(r'final-status-badge'))
+    if status_badge:
+        bill_info['status'] = status_badge.get_text(strip=True)
+    else:
+        # Fallback: try to find status in other ways
+        status_elem = soup.find('div', class_=re.compile(r'status'))
+        if status_elem:
+            # Get text and clean up duplicates/extra whitespace
+            status_text = status_elem.get_text(separator=' ', strip=True)
+            # Remove extra whitespace and take the most specific status (last one)
+            status_parts = [s.strip() for s in status_text.split('\n') if s.strip()]
+            # Remove 'Status' heading and duplicates
+            status_parts = [p for p in status_parts if p.lower() != 'status']
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_parts = []
+            for part in status_parts:
+                if part not in seen:
+                    seen.add(part)
+                    unique_parts.append(part)
+            # Use the first unique status (typically the main one)
+            bill_info['status'] = unique_parts[0] if unique_parts else status_text
+
+    # Extract sponsors
+    bill_info['sponsors'] = _extract_sponsors(soup)
+
+    # Extract committee assignment
+    committee_link = soup.find('a', href=re.compile(r'/committees/\d+[A-Z]/'))
+    if committee_link:
+        committee_name = committee_link.text.strip()
+        committee_url = f"{BASE_URL}{committee_link.get('href')}"
+        bill_info['committee'] = {
+            'name': committee_name,
+            'url': committee_url
+        }
+
+    # Extract subjects
+    subject_links = soup.find_all('a', href=re.compile(r'field_subjects='))
+    for link in subject_links:
+        subject = link.text.strip()
+        if subject:
+            bill_info['subjects'].append(subject)
+
+    # Extract last action
+    last_action_elem = soup.find(text=re.compile(r'LAST ACTION:'))
+    if last_action_elem:
+        parent = last_action_elem.find_parent()
+        if parent:
+            action_text = parent.text.replace('LAST ACTION:', '').strip()
+            bill_info['last_action'] = action_text
+
+    # Extract bill text versions
+    bill_info['bill_text'] = _extract_bill_text(soup)
+
+    # Extract fiscal notes
+    bill_info['fiscal_notes'] = _extract_fiscal_notes(soup)
+
+    # Extract amendments
+    bill_info['amendments'] = _extract_amendments(soup)
+
+    # Extract votes
+    bill_info['votes'] = _extract_votes(soup)
+
+    # Extract history
+    bill_info['history'] = _extract_history(soup)
+
+    # Extract PDF content if requested
+    if extract_content and cache_manager:
+        # Collect all PDF URLs from bill text, amendments, and fiscal notes
+        pdf_urls = []
+
+        # Bill text versions
+        for version in bill_info['bill_text']:
+            if version.get('url', '').lower().endswith('.pdf'):
+                pdf_urls.append(version['url'])
+
+        # Amendments
+        for amendment in bill_info['amendments']:
+            if amendment.get('url', '').lower().endswith('.pdf'):
+                pdf_urls.append(amendment['url'])
+
+        # Fiscal notes
+        for note in bill_info['fiscal_notes']:
+            if note.get('url', '').lower().endswith('.pdf'):
+                pdf_urls.append(note['url'])
+
+        # Extract all PDFs in parallel
+        if pdf_urls:
+            extraction_results = batch_extract_pdfs(
+                pdf_urls,
+                cache_manager=cache_manager,
+                progress_callback=progress_callback
+            )
+
+            # Add extracted content to bill text versions
+            for version in bill_info['bill_text']:
+                url = version.get('url')
+                if url in extraction_results:
+                    result = extraction_results[url]
+                    version['content'] = result.get('text', '')
+                    version['pages'] = result.get('pages', 0)
+                    if result.get('error'):
+                        version['extraction_error'] = result['error']
+
+            # Add extracted content to amendments
+            for amendment in bill_info['amendments']:
+                url = amendment.get('url')
+                if url in extraction_results:
+                    result = extraction_results[url]
+                    amendment['content'] = result.get('text', '')
+                    amendment['pages'] = result.get('pages', 0)
+                    if result.get('error'):
+                        amendment['extraction_error'] = result['error']
+
+            # Add extracted content to fiscal notes
+            for note in bill_info['fiscal_notes']:
+                url = note.get('url')
+                if url in extraction_results:
+                    result = extraction_results[url]
+                    note['content'] = result.get('text', '')
+                    note['pages'] = result.get('pages', 0)
+                    if result.get('error'):
+                        note['extraction_error'] = result['error']
+
+    # Cache result
+    if cache_manager:
+        cache_manager.set(cache_key, bill_info, subdirectory='bills')
+
+    return bill_info
+
+
+def search_bills(
+    query: str,
+    session: Optional[str] = None,
+    chamber: Optional[str] = None,
+    limit: int = 50,
+    cache_manager=None
+) -> List[Dict[str, Any]]:
+    """
+    Search bills by keyword.
+
+    Args:
+        query: Search query string
+        session: Session code to filter by
+        chamber: Chamber to filter by
+        limit: Maximum number of results
+        cache_manager: Optional cache manager
+
+    Returns:
+        List of matching bill dicts
+    """
+    if not session:
+        session = get_current_session()
+
+    # Build search parameters
+    params = {
+        f'field_sessions[{session}]': session,
+        'combine': query,
+        'sort_bef_combine': 'search_api_relevance DESC',
+        'page': 0
+    }
+
+    if chamber:
+        params['field_chamber'] = chamber
+
+    bills = []
+    page = 0
+
+    while len(bills) < limit:
+        params['page'] = page
+
+        try:
+            response = requests.get(BILLS_SEARCH_URL, params=params, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise Exception(f"Failed to search bills: {e}")
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        page_bills = _extract_bills_from_search(soup)
+
+        if not page_bills:
+            break
+
+        bills.extend(page_bills)
+
+        if len(page_bills) < 25:
+            break
+
+        page += 1
+
+    return bills[:limit]
+
+
+def _extract_bills_from_search(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """
+    Extract bill information from search results page.
+
+    Args:
+        soup: BeautifulSoup object of search results page
+
+    Returns:
+        List of bill dicts with basic information
+    """
+    bills = []
+
+    # Find all bill result items
+    result_items = soup.find_all('div', class_=re.compile(r'views-row'))
+
+    for item in result_items:
+        bill = {
+            'bill_number': None,
+            'title': None,
+            'long_title': None,
+            'url': None,
+            'last_action': None,
+            'subjects': [],
+            'sponsors': []
+        }
+
+        # Extract bill number and title from h3
+        heading = item.find('h3')
+        if heading:
+            link = heading.find('a')
+            if link:
+                # Bill number is typically at the start
+                text = heading.text.strip()
+                # Extract bill number pattern
+                bill_match = re.search(r'([HS][BCJM][JR]*\d+-\d+)', text, re.I)
+                if bill_match:
+                    bill['bill_number'] = bill_match.group(1).upper()
+
+                # Title is the link text (minus bill number)
+                title = link.text.strip()
+                title = re.sub(r'^[HS][BCJM][JR]*\d+-\d+\s*', '', title, flags=re.I)
+                bill['title'] = title
+
+                # URL
+                href = link.get('href', '')
+                bill['url'] = f"{BASE_URL}{href}" if href.startswith('/') else href
+
+        # Extract long title
+        long_title = item.find('div', class_=re.compile(r'field.*long'))
+        if long_title:
+            bill['long_title'] = long_title.text.strip()
+
+        # Extract last action
+        last_action = item.find(text=re.compile(r'LAST ACTION:'))
+        if last_action:
+            parent = last_action.find_parent()
+            if parent:
+                action_text = parent.text.replace('LAST ACTION:', '').strip()
+                bill['last_action'] = action_text
+
+        # Extract subjects
+        subjects_section = item.find(text=re.compile(r'SUBJECTS:'))
+        if subjects_section:
+            parent = subjects_section.find_parent()
+            if parent:
+                subject_links = parent.find_all('a')
+                for link in subject_links:
+                    subject = link.text.strip()
+                    if subject:
+                        bill['subjects'].append(subject)
+
+        # Extract sponsors
+        sponsors_section = item.find(text=re.compile(r'SPONSORS:'))
+        if sponsors_section:
+            parent = sponsors_section.find_parent()
+            if parent:
+                sponsor_links = parent.find_all('a', href=re.compile(r'/legislators/'))
+                for link in sponsor_links:
+                    sponsor = link.text.strip()
+                    if sponsor:
+                        bill['sponsors'].append(sponsor)
+
+        if bill['bill_number']:
+            bills.append(bill)
+
+    return bills
+
+
+def _extract_sponsors(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    """Extract bill sponsors."""
+    sponsors = []
+
+    # Find sponsor section
+    sponsor_section = soup.find('div', class_=re.compile(r'sponsor'))
+    if not sponsor_section:
+        sponsor_heading = soup.find(text=re.compile(r'Sponsors?', re.I))
+        if sponsor_heading:
+            sponsor_section = sponsor_heading.find_parent('div') or sponsor_heading.find_parent('section')
+
+    if sponsor_section:
+        # Find all legislator links
+        sponsor_links = sponsor_section.find_all('a', href=re.compile(r'/legislators/'))
+
+        for link in sponsor_links:
+            # Collapse all whitespace to single spaces
+            sponsor_name = ' '.join(link.text.split())
+            sponsor_url = f"{BASE_URL}{link.get('href')}"
+
+            # Try to determine if prime or co-sponsor
+            role = 'Prime Sponsor'
+            parent_text = link.find_parent().text if link.find_parent() else ''
+            if 'co-sponsor' in parent_text.lower():
+                role = 'Co-Sponsor'
+
+            sponsors.append({
+                'name': sponsor_name,
+                'role': role,
+                'url': sponsor_url
+            })
+
+    return sponsors
+
+
+def _extract_bill_text(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    """Extract bill text versions."""
+    versions = []
+
+    # Find bill text section
+    bill_text_section = soup.find('div', id=re.compile(r'bill.*text'))
+    if bill_text_section:
+        # Find all download links
+        links = bill_text_section.find_all('a', href=re.compile(r'/bill_files/'))
+
+        for link in links:
+            version = {
+                'version': None,
+                'date': None,
+                'url': None
+            }
+
+            # Extract version name from aria-label (most reliable)
+            aria_label = link.get('aria-label', '')
+            if aria_label:
+                # Pattern: "PDF Bill File for HB26-1001 Introduced"
+                # Extract the last word(s) after the bill number
+                parts = aria_label.split()
+                if len(parts) > 0:
+                    # Find bill number pattern (e.g., HB26-1001, SB26-004)
+                    for i, part in enumerate(parts):
+                        if re.match(r'[HS][BJ]R?\d{2}-\d+', part):
+                            # Everything after the bill number is the version
+                            if i + 1 < len(parts):
+                                version['version'] = ' '.join(parts[i+1:])
+                            break
+                    # If no bill number found, try last word
+                    if not version['version'] and parts:
+                        version['version'] = parts[-1]
+
+            # Fallback: Extract version name from link text
+            if not version['version']:
+                link_text = link.text.strip()
+                if link_text and link_text.lower() not in ['download', 'pdf', 'view']:
+                    version['version'] = link_text
+
+            # Extract version name and date from surrounding text
+            parent = link.find_parent()
+            if parent:
+                text = parent.text.strip()
+                # Common patterns: "Introduced (01/15/2026)", "Engrossed (02/03/2026)"
+                version_match = re.search(r'([A-Za-z\s]+)\s*\((\d{2}/\d{2}/\d{4})\)', text)
+                if version_match:
+                    # Only override if we didn't get it from aria-label
+                    if not version['version']:
+                        version['version'] = version_match.group(1).strip()
+                    version['date'] = version_match.group(2)
+
+            # URL
+            href = link.get('href', '')
+            version['url'] = f"{BASE_URL}{href}" if href.startswith('/') else href
+
+            if version['url']:
+                versions.append(version)
+
+    return versions
+
+
+def _extract_fiscal_notes(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    """Extract fiscal notes."""
+    fiscal_notes = []
+
+    # Find fiscal section
+    fiscal_section = soup.find('div', id=re.compile(r'fiscal'))
+    if fiscal_section:
+        # Find all fiscal note links
+        links = fiscal_section.find_all('a', href=re.compile(r'fiscal'))
+
+        for link in links:
+            note = {
+                'version': None,
+                'date': None,
+                'url': None
+            }
+
+            # Extract info from text
+            text = link.text.strip()
+            # Common pattern: "FN1 (01/20/2026)"
+            note_match = re.search(r'(FN\d+)\s*\((\d{2}/\d{2}/\d{4})\)', text)
+            if note_match:
+                note['version'] = note_match.group(1)
+                note['date'] = note_match.group(2)
+
+            href = link.get('href', '')
+            note['url'] = f"{BASE_URL}{href}" if href.startswith('/') else href
+
+            if note['url']:
+                fiscal_notes.append(note)
+
+    return fiscal_notes
+
+
+def _extract_amendments(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """Extract amendments."""
+    amendments = []
+
+    # Find amendments section
+    amendments_section = soup.find('div', id=re.compile(r'amendment'))
+    if amendments_section:
+        # Find amendment table
+        table = amendments_section.find('table')
+        if table:
+            rows = table.find_all('tr')[1:]  # Skip header
+
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) >= 4:
+                    amendment = {
+                        'date': cells[0].text.strip(),
+                        'number': cells[1].text.strip(),
+                        'location': cells[2].text.strip(),
+                        'status': cells[3].text.strip(),
+                        'url': None
+                    }
+
+                    # Find download link
+                    link = row.find('a', href=re.compile(r'/bill_amendments/'))
+                    if link:
+                        href = link.get('href', '')
+                        amendment['url'] = f"{BASE_URL}{href}" if href.startswith('/') else href
+
+                    amendments.append(amendment)
+
+    return amendments
+
+
+def _extract_votes(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """Extract vote records."""
+    votes = []
+
+    # Find votes section or table
+    vote_table = soup.find('table', class_=re.compile(r'vote'))
+    if not vote_table:
+        # Try finding by heading
+        vote_heading = soup.find(text=re.compile(r'Vote.*History', re.I))
+        if vote_heading:
+            parent = vote_heading.find_parent()
+            if parent:
+                vote_table = parent.find_next('table')
+
+    if vote_table:
+        rows = vote_table.find_all('tr')[1:]  # Skip header
+
+        for row in rows:
+            cells = row.find_all('td')
+            if len(cells) >= 3:
+                vote = {
+                    'date': cells[0].text.strip(),
+                    'calendar': cells[1].text.strip() if len(cells) > 1 else None,
+                    'motion': cells[2].text.strip() if len(cells) > 2 else None,
+                    'result': cells[3].text.strip() if len(cells) > 3 else None,
+                    'url': None
+                }
+
+                # Find vote document link
+                link = row.find('a', href=re.compile(r'/bill_votes/'))
+                if link:
+                    href = link.get('href', '')
+                    vote['url'] = f"{BASE_URL}{href}" if href.startswith('/') else href
+
+                votes.append(vote)
+
+    return votes
+
+
+def _extract_history(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    """Extract bill history timeline."""
+    history = []
+
+    # Find history section
+    history_section = soup.find('div', id=re.compile(r'history'))
+    if history_section:
+        # Find all history items (could be list items or divs)
+        items = history_section.find_all(['li', 'div'], class_=re.compile(r'history.*item'))
+
+        for item in items:
+            entry = {
+                'date': None,
+                'action': None,
+                'location': None
+            }
+
+            text = item.text.strip()
+
+            # Try to parse date and action
+            # Common format: "01/15/2026 - Introduced in House"
+            date_match = re.search(r'(\d{2}/\d{2}/\d{4})\s*[-:]\s*(.+)', text)
+            if date_match:
+                entry['date'] = date_match.group(1)
+                entry['action'] = date_match.group(2).strip()
+            else:
+                entry['action'] = text
+
+            if entry['action']:
+                history.append(entry)
+
+    return history
+
+
+def extract_bill_content(bill_info: Dict[str, Any], cache_manager=None, progress_callback=None) -> Dict[str, Any]:
+    """
+    Extract PDF content from an existing bill info dict.
+
+    Useful for extracting content from bills retrieved from cache without
+    needing to re-fetch the bill page.
+
+    Args:
+        bill_info: Bill info dict from get_bill_info()
+        cache_manager: Optional cache manager for caching extraction results
+        progress_callback: Optional callback(completed, total, url, from_cache) for progress
+
+    Returns:
+        Updated bill_info dict with 'content' fields added to bill_text, amendments, fiscal_notes
+    """
+    if not cache_manager:
+        return bill_info
+
+    # Collect all PDF URLs
+    pdf_urls = []
+
+    for version in bill_info.get('bill_text', []):
+        if version.get('url', '').lower().endswith('.pdf'):
+            pdf_urls.append(version['url'])
+
+    for amendment in bill_info.get('amendments', []):
+        if amendment.get('url', '').lower().endswith('.pdf'):
+            pdf_urls.append(amendment['url'])
+
+    for note in bill_info.get('fiscal_notes', []):
+        if note.get('url', '').lower().endswith('.pdf'):
+            pdf_urls.append(note['url'])
+
+    # Extract all PDFs
+    if pdf_urls:
+        extraction_results = batch_extract_pdfs(
+            pdf_urls,
+            cache_manager=cache_manager,
+            progress_callback=progress_callback
+        )
+
+        # Add to bill text versions
+        for version in bill_info.get('bill_text', []):
+            url = version.get('url')
+            if url in extraction_results:
+                result = extraction_results[url]
+                version['content'] = result.get('text', '')
+                version['pages'] = result.get('pages', 0)
+                if result.get('error'):
+                    version['extraction_error'] = result['error']
+
+        # Add to amendments
+        for amendment in bill_info.get('amendments', []):
+            url = amendment.get('url')
+            if url in extraction_results:
+                result = extraction_results[url]
+                amendment['content'] = result.get('text', '')
+                amendment['pages'] = result.get('pages', 0)
+                if result.get('error'):
+                    amendment['extraction_error'] = result['error']
+
+        # Add to fiscal notes
+        for note in bill_info.get('fiscal_notes', []):
+            url = note.get('url')
+            if url in extraction_results:
+                result = extraction_results[url]
+                note['content'] = result.get('text', '')
+                note['pages'] = result.get('pages', 0)
+                if result.get('error'):
+                    note['extraction_error'] = result['error']
+
+    return bill_info

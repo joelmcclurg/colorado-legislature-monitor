@@ -1,0 +1,36 @@
+# Cache directory
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated output
+nutrition_assistance_report.html
+
+# Internal dev notes
+IMPLEMENTATION_COMPLETE.md
+
+# Environment / secrets
+.env
