@@ -4,7 +4,7 @@ A command-line tool for monitoring the Colorado General Assembly. Tracks committ
 
 Built to help policy advocates stay on top of legislative activity without manually checking dozens of web pages.
 
-**Version**: 0.8.0
+**Version**: 0.9.0
 **Current Session**: 2026A
 
 ## What It Does
@@ -17,6 +17,7 @@ Built to help policy advocates stay on top of legislative activity without manua
 - **Cross-Data Search** - Search across schedules, recordings, documents, bills, and transcripts with a single query
 - **Phrase Search** - Use `"quoted phrases"` to find exact matches (e.g., `"food assistance"`)
 - **Watchlists** - Automated keyword monitoring with "new only" filtering
+- **Advocacy Reports** - HTML reports with possible legislative champions, bill tracking, hearing mentions, and strategic next steps
 
 ## Installation
 
@@ -187,6 +188,24 @@ python scripts/legislature.py watch run snap --new-only
 python scripts/legislature.py watch delete snap
 ```
 
+### Advocacy Reports
+
+```bash
+# Generate report on a topic (default: last 60 days)
+python scripts/legislature.py report SNAP "food assistance"
+
+# Custom time window
+python scripts/legislature.py report SNAP --days 90
+
+# Specific start date
+python scripts/legislature.py report housing --since 2026-01-01
+
+# Generate and open in browser
+python scripts/legislature.py report SNAP --days 60 --open
+```
+
+Reports are self-contained HTML files saved to `data/reports/`. They include an executive summary, possible legislative champions (identified from transcript speaker data), matched bills, committee hearing mentions, mention frequency, and strategic next steps.
+
 ## Data Sources
 
 | Source | URL | Method |
@@ -280,4 +299,4 @@ For personal and educational use. Data sourced from colorado.leg.gov (public dom
 
 ---
 
-**Last Updated**: February 5, 2026
+**Last Updated**: February 6, 2026

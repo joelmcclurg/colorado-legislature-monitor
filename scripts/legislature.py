@@ -8,6 +8,7 @@ with a focus on the Joint Budget Committee (JBC).
 import argparse
 import sys
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 # Suppress SSL warnings from urllib3
@@ -21,13 +22,13 @@ from scrapers.schedules import get_jbc_schedule_for_week, get_current_week_numbe
 from scrapers.sessions import get_current_session
 from scrapers.audio import fetch_jbc_recordings, get_recordings_for_week
 from scrapers.documents import fetch_budget_documents, get_documents_for_department, get_documents_by_type, list_departments
-from scrapers.search import search_all
+from scrapers.search import search_all, filter_results_since, build_search_pattern, highlight_matches
 from scrapers.watchlist import WatchlistManager
 from scrapers.committees import list_committees, get_committee_info, search_committees
 from scrapers.bills import list_bills, get_bill_info, search_bills, extract_bill_content
 from scrapers.transcripts import (
     transcribe_recording, get_transcript, list_transcribed_recordings,
-    batch_transcribe, estimate_cost
+    batch_transcribe, estimate_cost, resolve_speakers, format_timestamp
 )
 from scrapers.sliq import (
     PRIORITY_COMMITTEES, fetch_committee_recordings, fetch_all_priority_recordings
@@ -40,7 +41,7 @@ from formatters.markdown import (
     format_bills_list, format_bill_info, format_transcript, format_transcript_list,
     format_transcription_status
 )
-from formatters.html import format_search_results_html
+from formatters.html import format_search_results_html, format_advocacy_report_html
 
 
 def cmd_jbc_schedule(args):
@@ -921,9 +922,174 @@ def cmd_transcript_status_all(args):
         return 1
 
 
+def cmd_report(args):
+    """Handle 'report' command - generate advocacy HTML report."""
+    cache = CacheManager()
+
+    try:
+        # Build query string preserving quoted phrases
+        # Re-quote multi-word args (shell strips quotes before argparse sees them)
+        parts = []
+        for kw in args.keywords:
+            if ' ' in kw:
+                parts.append(f'"{kw}"')
+            else:
+                parts.append(kw)
+        keywords = ' '.join(parts)
+
+        # Compute since_date
+        if hasattr(args, 'since') and args.since:
+            since_date = args.since
+        else:
+            days = getattr(args, 'days', 60) or 60
+            from datetime import timedelta
+            since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        # Run search
+        results = search_all(query=keywords, cache_manager=cache)
+
+        # Filter by date
+        results = filter_results_since(results, since_date)
+
+        # Collect committee member data for recordings
+        committee_members = {}
+        seen_slugs = set()
+        for rec in results.get('recordings', []):
+            slug = rec.get('committee', '')
+            cname = rec.get('committee_name', '')
+            if slug and slug not in seen_slugs:
+                seen_slugs.add(slug)
+                try:
+                    # Strip _House/_Senate suffixes for lookup
+                    lookup_slug = slug
+                    for suffix in ('_House', '_Senate'):
+                        if lookup_slug.endswith(suffix):
+                            lookup_slug = lookup_slug[:-len(suffix)]
+                            break
+                    info = get_committee_info(lookup_slug, cache_manager=cache)
+                    if info and info.get('members'):
+                        committee_members[cname] = info['members']
+                except Exception:
+                    pass
+
+        # Resolve speaker labels in transcript excerpt strings
+        for rec in results.get('recordings', []):
+            clip_id = rec.get('clip_id', '')
+            committee_name = rec.get('committee_name', '')
+            contexts = rec.get('match_context', [])
+            if not clip_id or not contexts or not isinstance(contexts, list):
+                continue
+            members = committee_members.get(committee_name, [])
+            if not members:
+                continue
+            transcript = get_transcript(clip_id, cache_manager=cache)
+            if not transcript:
+                continue
+            speaker_map = resolve_speakers(transcript, members)
+            if not speaker_map:
+                continue
+            new_contexts = []
+            for ctx in contexts:
+                for label, info in speaker_map.items():
+                    ctx = ctx.replace(f'[Speaker {label},', f'[{info["display"]},')
+                new_contexts.append(ctx)
+            rec['match_context'] = new_contexts
+
+        # Build champion data from resolved speakers + full transcripts
+        pattern = build_search_pattern(keywords)
+        champions_agg = {}  # keyed by legislator name
+        for rec in results.get('recordings', []):
+            clip_id = rec.get('clip_id', '')
+            committee_name = rec.get('committee_name', '')
+            if not clip_id:
+                continue
+            members = committee_members.get(committee_name, [])
+            if not members:
+                continue
+            transcript = get_transcript(clip_id, cache_manager=cache)
+            if not transcript:
+                continue
+            speaker_map = resolve_speakers(transcript, members)
+            if not speaker_map:
+                continue
+            # Scan all utterances for keyword mentions by resolved speakers
+            for utt in transcript.get('utterances', []):
+                spk = utt.get('speaker', '')
+                if spk not in speaker_map:
+                    continue
+                text = utt.get('text', '')
+                matches = pattern.findall(text) if pattern else []
+                if not matches:
+                    continue
+                info = speaker_map[spk]
+                name = info['name']
+                if name not in champions_agg:
+                    member = None
+                    for m in members:
+                        if m.get('name') == name:
+                            member = m
+                            break
+                    champions_agg[name] = {
+                        'name': name,
+                        'display': info['display'],
+                        'role': member.get('role', 'Member') if member else 'Member',
+                        'chamber': member.get('chamber', '') if member else '',
+                        'committee': committee_name,
+                        'mention_count': 0,
+                        'sample_quotes': [],
+                    }
+                champions_agg[name]['mention_count'] += len(matches)
+                # Collect up to 2 sample quotes per champion
+                if len(champions_agg[name]['sample_quotes']) < 2:
+                    ts = format_timestamp(utt.get('start', 0))
+                    match = pattern.search(text)
+                    if match and len(text) > 200:
+                        start_pos = max(0, match.start() - 75)
+                        end_pos = min(len(text), match.end() + 75)
+                        snippet = text[start_pos:end_pos]
+                        if start_pos > 0:
+                            snippet = "..." + snippet
+                        if end_pos < len(text):
+                            snippet = snippet + "..."
+                    else:
+                        snippet = text[:200] + ("..." if len(text) > 200 else "")
+                    snippet = highlight_matches(snippet, pattern)
+                    champions_agg[name]['sample_quotes'].append(f"[{ts}] {snippet}")
+
+        # Sort by mention count, take top 8
+        champions = sorted(champions_agg.values(), key=lambda x: x['mention_count'], reverse=True)[:8]
+
+        # Generate HTML report
+        report_html = format_advocacy_report_html(results, keywords, since_date, committee_members=committee_members, champions=champions)
+
+        # Save to file
+        reports_dir = Path(cache.base_dir) / 'reports'
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        filepath = reports_dir / filename
+        filepath.write_text(report_html, encoding='utf-8')
+
+        print(f"Report saved to: {filepath}")
+        print(f"Results: {results['total_count']} matches ({len(results.get('bills', []))} bills, "
+              f"{len(results.get('recordings', []))} hearings, "
+              f"{len(results.get('documents', []))} documents, "
+              f"{len(results.get('schedules', []))} schedule items)")
+
+        # Open in browser if requested
+        if getattr(args, 'open', False):
+            import subprocess
+            subprocess.run(['open', str(filepath)])
+
+        return 0
+
+    except Exception as e:
+        print(format_error(f"Error generating report: {str(e)}"))
+        return 1
+
+
 def cmd_version(args):
     """Handle 'version' command."""
-    print("Colorado Legislature Monitor v0.8.0 (Phase 8 - Multi-Committee Recordings)")
+    print("Colorado Legislature Monitor v0.9.0 (Phase 9 - Advocacy Reports & Champion Identification)")
     print(f"Current session: {get_current_session()}")
     print(f"Current week: {get_current_week_number()}")
     return 0
@@ -1249,6 +1415,18 @@ Examples:
     # transcript status
     transcript_subparsers.add_parser('status', help='Show transcript status for all recordings')
 
+    # Report command (advocacy HTML report)
+    report_parser = subparsers.add_parser('report', help='Generate advocacy HTML report')
+    report_parser.add_argument('keywords', nargs='+', help='Search keywords (quote phrases: "Nutrition Assistance")')
+    report_parser.add_argument(
+        '--days', type=int, default=60,
+        help='Number of days to look back (default: 60)')
+    report_parser.add_argument(
+        '--since', help='Start date YYYY-MM-DD (overrides --days)')
+    report_parser.add_argument(
+        '--open', action='store_true',
+        help='Open report in browser after generating')
+
     # Version command
     subparsers.add_parser('version', help='Show version info')
 
@@ -1332,6 +1510,8 @@ Examples:
         else:
             transcript_parser.print_help()
             return 1
+    elif args.command == 'report':
+        return cmd_report(args)
     elif args.command == 'version':
         return cmd_version(args)
     else:

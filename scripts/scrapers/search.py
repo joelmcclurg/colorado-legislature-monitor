@@ -268,6 +268,25 @@ def _extract_transcript_context(transcript, pattern, max_matches=3):
     return contexts
 
 
+def count_transcript_mentions(transcript, pattern):
+    """
+    Count total keyword matches in transcript text.
+
+    Args:
+        transcript: Transcript data dict with 'text' field
+        pattern: Compiled regex pattern
+
+    Returns:
+        int: Number of matches found
+    """
+    if not transcript or not pattern:
+        return 0
+    text = transcript.get('text', '')
+    if not text:
+        return 0
+    return len(pattern.findall(text))
+
+
 def search_recordings(query, cache_manager=None):
     """
     Search across all recording data (Granicus JBC + SLIQ priority committees),
@@ -362,9 +381,11 @@ def search_recordings(query, cache_manager=None):
             if transcript_match:
                 result['match_location'] = 'transcript'
                 result['match_context'] = transcript_contexts
+                result['mention_count'] = count_transcript_mentions(transcript, pattern)
             else:
                 result['match_location'] = 'title'
                 result['match_context'] = None
+                result['mention_count'] = 0
 
             results.append(result)
 

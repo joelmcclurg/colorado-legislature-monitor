@@ -2,7 +2,9 @@
 import json
 import os
 import re
+from collections import Counter, defaultdict
 from datetime import datetime
+from difflib import get_close_matches
 from pathlib import Path
 
 import requests
@@ -12,6 +14,13 @@ GRANICUS_PLAYER_URL = "https://coloradoga.granicus.com/MediaPlayer.php?view_id=2
 
 # AssemblyAI pricing per hour
 ASSEMBLYAI_COST_PER_HOUR = 0.37
+
+# Roll call / voting response patterns
+_PRESENT_RESPONSES = {'here', 'present', 'i am here', 'here madam chair',
+                      'here mr chair', 'here mister chair'}
+_ABSENT_RESPONSES = {'excused', 'absent', 'not present', 'absent excused',
+                     'excused absent'}
+_VOTE_RESPONSES = {'aye', 'yes', 'no', 'nay', 'yea'}
 
 
 def _get_api_key():
@@ -61,6 +70,324 @@ def format_timestamp(ms):
     minutes = (total_seconds % 3600) // 60
     seconds = total_seconds % 60
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def resolve_speakers(transcript_data, members):
+    """
+    Map speaker labels to real committee member names using Robert's Rules patterns.
+
+    Args:
+        transcript_data: Transcript dict with 'utterances' list
+        members: List of member dicts from get_committee_info() with name, role, chamber
+
+    Returns:
+        dict: {speaker_label: {"name": "Emily Sirota", "display": "Chair Sirota"}}
+    """
+    utterances = transcript_data.get('utterances', [])
+    if not utterances or not members:
+        return {}
+
+    # Build last_names lookup: {"sirota": member_dict, ...}
+    last_names = {}
+    for m in members:
+        name = m.get('name', '')
+        if name:
+            parts = name.split()
+            if parts:
+                last_names[parts[-1].lower()] = m
+
+    # All known last names for fuzzy matching
+    all_last_names = list(last_names.keys())
+
+    # --- Heuristic 1: Chair identification ---
+    # Count which speaker is addressed as "Madam Chair" / "Mr. Chair" by others
+    chair_evidence = Counter()
+    for i, utt in enumerate(utterances):
+        text = utt.get('text', '')
+        if re.search(r'\b(?:Madam|Mr\.|Mister)\s+Chair', text, re.IGNORECASE):
+            # Credit the previous different speaker as chair
+            speaker = utt['speaker']
+            for j in range(i - 1, -1, -1):
+                if utterances[j]['speaker'] != speaker:
+                    chair_evidence[utterances[j]['speaker']] += 1
+                    break
+
+    # Find chair member
+    chair_member = None
+    for m in members:
+        if m.get('role') == 'Chair':
+            chair_member = m
+            break
+
+    speaker_map = {}  # label -> {"name": ..., "display": ..., "evidence": count}
+
+    if chair_evidence and chair_member:
+        chair_speaker = chair_evidence.most_common(1)[0]
+        if chair_speaker[1] >= 2:  # Minimum 2 evidence points
+            last = chair_member['name'].split()[-1]
+            speaker_map[chair_speaker[0]] = {
+                'name': chair_member['name'],
+                'display': f'Chair {last}',
+                'evidence': chair_speaker[1],
+            }
+
+    member_evidence = defaultdict(Counter)  # {member_last_name: Counter({speaker_label: count})}
+    nonmember_map = {}  # {speaker_label: {"name": "First Last", "display": "...", "evidence": 1}}
+
+    # Find which speaker label is the chair (if identified)
+    chair_label = None
+    for label, info in speaker_map.items():
+        if 'Chair' in info['display']:
+            chair_label = label
+            break
+
+    # --- Heuristic 2: Name-Call → Response Detection (Roll Call & Voting) ---
+    for i, utt in enumerate(utterances):
+        if i + 1 >= len(utterances):
+            break
+        text = utt.get('text', '').strip()
+        if len(text) > 60:
+            continue  # Too long to be a name call
+
+        # Strip preamble like "Senators and Representatives."
+        cleaned = re.sub(r'^(?:Senators?\s+and\s+Representatives?\.?\s*)', '', text, flags=re.IGNORECASE)
+        cleaned = cleaned.strip().rstrip('?.,!').strip()
+
+        if not cleaned:
+            continue
+
+        cleaned_lower = cleaned.lower()
+        # Skip "Madam Chair" / "Mr. Chair" calls (handled by Heuristic 1)
+        if re.search(r'\b(?:madam|mr|mister)\s+chair\b', cleaned_lower):
+            continue
+
+        # Check if cleaned text matches/contains a member last name
+        called_name = None
+        for word in cleaned_lower.split():
+            word_clean = re.sub(r'[^a-z]', '', word)
+            if word_clean in last_names:
+                called_name = word_clean
+                break
+
+        # Try fuzzy if no exact match
+        if not called_name:
+            for word in cleaned_lower.split():
+                word_clean = re.sub(r'[^a-z]', '', word)
+                if len(word_clean) >= 3:
+                    fuzzy = get_close_matches(word_clean, all_last_names, n=1, cutoff=0.8)
+                    if fuzzy:
+                        called_name = fuzzy[0]
+                        break
+
+        if not called_name:
+            continue
+
+        # Check next utterance for response
+        next_utt = utterances[i + 1]
+        if next_utt['speaker'] == utt['speaker']:
+            continue  # Same speaker, not a response
+
+        resp_text = next_utt.get('text', '').strip().lower().rstrip('.!,')
+        if len(resp_text) > 30:
+            continue  # Too long to be a roll call response
+
+        if resp_text in _PRESENT_RESPONSES or resp_text in _VOTE_RESPONSES:
+            member_evidence[called_name][next_utt['speaker']] += 3
+        # If absent response, just skip (don't map)
+
+    # --- Heuristic 3: Self-Identification (members and non-members) ---
+    self_id_patterns = [
+        re.compile(r'\bmy\s+name\s+is\s+([A-Z][a-z]+)\s+([A-Z][a-z]+(?:-[A-Z][a-z]+)?)', re.IGNORECASE),
+        re.compile(r"\bI'?m\s+([A-Z][a-z]+)\s+([A-Z][a-z]+(?:-[A-Z][a-z]+)?)", re.IGNORECASE),
+        re.compile(r'\bI\s+am\s+([A-Z][a-z]+)\s+([A-Z][a-z]+(?:-[A-Z][a-z]+)?)', re.IGNORECASE),
+    ]
+    for utt in utterances:
+        text = utt.get('text', '')
+        speaker = utt['speaker']
+        for pattern in self_id_patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            first_name = match.group(1)
+            last_name_found = match.group(2)
+            last_lower = last_name_found.lower()
+
+            # Try member match first (members always win, weight +4)
+            matched = None
+            if last_lower in last_names:
+                matched = last_lower
+            else:
+                fuzzy = get_close_matches(last_lower, all_last_names, n=1, cutoff=0.7)
+                if fuzzy:
+                    matched = fuzzy[0]
+            if matched:
+                member_evidence[matched][speaker] += 4
+                break
+
+            # Non-member: capture name + try to extract title/org
+            if speaker not in nonmember_map:
+                full_name = f"{first_name} {last_name_found}"
+                title = None
+                # Extract title: ", [title]." after the name
+                after_name = text[match.end():]
+                title_match = re.match(r',\s+(.+?)\.', after_name)
+                if not title_match:
+                    # "I'm the [title]" pattern after name
+                    title_match2 = re.search(r"\.?\s+I'?m\s+the\s+(.+?)\.", after_name)
+                    if title_match2:
+                        title = title_match2.group(1).strip()
+                else:
+                    title = title_match.group(1).strip()
+                display = f"{full_name} ({title})" if title else full_name
+                nonmember_map[speaker] = {
+                    'name': full_name,
+                    'display': display,
+                    'evidence': 1,
+                }
+            break
+
+    # --- Heuristic 3b: Witness Introduction Pattern ---
+    # Detects "[First] [Last], [title/org]." at utterance start
+    witness_pattern = re.compile(
+        r'^([A-Z][a-z]+)\s+([A-Z][a-z]+(?:-[A-Z][a-z]+)?),\s+(.+?)\.'
+    )
+    for utt in utterances:
+        text = utt.get('text', '').strip()
+        speaker = utt['speaker']
+        if speaker in nonmember_map:
+            continue
+        match = witness_pattern.match(text)
+        if not match:
+            continue
+        first_name = match.group(1)
+        last_name_found = match.group(2)
+        title = match.group(3).strip()
+        last_lower = last_name_found.lower()
+
+        # Skip if last name matches a committee member
+        if last_lower in last_names:
+            continue
+        fuzzy = get_close_matches(last_lower, all_last_names, n=1, cutoff=0.8)
+        if fuzzy:
+            continue
+
+        full_name = f"{first_name} {last_name_found}"
+        nonmember_map[speaker] = {
+            'name': full_name,
+            'display': f"{full_name} ({title})",
+            'evidence': 1,
+        }
+
+    # --- Heuristic 4: "Chair calls on member" pattern ---
+    # When chair says "Representative Brown" near end of utterance, next different speaker is Brown
+    # Scan chair's utterances (and all utterances for "Thank you" patterns)
+    for i, utt in enumerate(utterances):
+        text = utt.get('text', '')
+        speaker = utt['speaker']
+
+        # Pattern A: Chair introduces next speaker at end of utterance
+        if chair_label and speaker == chair_label:
+            # Look at last 200 chars for member name
+            tail = text[-200:] if len(text) > 200 else text
+            name_matches = re.findall(
+                r'(?:Representative|Senator|Rep\.|Sen\.|Vice\s+Chair)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',
+                tail
+            )
+            if name_matches:
+                called_name = name_matches[-1].split()[-1].lower()  # Last word
+                # Exact or fuzzy match
+                matched = None
+                if called_name in last_names:
+                    matched = called_name
+                else:
+                    fuzzy = get_close_matches(called_name, all_last_names, n=1, cutoff=0.6)
+                    if fuzzy:
+                        matched = fuzzy[0]
+                if matched:
+                    # Credit next different speaker
+                    for j in range(i + 1, len(utterances)):
+                        if utterances[j]['speaker'] != speaker:
+                            member_evidence[matched][utterances[j]['speaker']] += 1
+                            break
+
+        # Pattern B: "Thank you, Rep./Sen. <Name>" at start credits previous speaker
+        thank_match = re.match(
+            r'^(?:Thank you,?\s+)?(?:Representative|Senator|Rep\.|Sen\.|Vice\s+Chair)\s+([A-Z][a-z]+)',
+            text
+        )
+        if thank_match:
+            thanked_name = thank_match.group(1).lower()
+            matched = None
+            if thanked_name in last_names:
+                matched = thanked_name
+            else:
+                fuzzy = get_close_matches(thanked_name, all_last_names, n=1, cutoff=0.6)
+                if fuzzy:
+                    matched = fuzzy[0]
+            if matched:
+                # Credit previous different speaker
+                for j in range(i - 1, -1, -1):
+                    if utterances[j]['speaker'] != speaker:
+                        member_evidence[matched][utterances[j]['speaker']] += 1
+                        break
+
+    # --- Assign members to speaker labels ---
+    # For each member with evidence, find best speaker label
+    assignments = []  # [(member_last_name, speaker_label, evidence_count)]
+    for member_name, label_counts in member_evidence.items():
+        if not label_counts:
+            continue
+        best_label, best_count = label_counts.most_common(1)[0]
+        total = sum(label_counts.values())
+        # Require minimum 2 evidence points and >50% majority
+        if best_count >= 2 and best_count > total * 0.5:
+            assignments.append((member_name, best_label, best_count))
+
+    # Sort by evidence (highest first) for dedup
+    assignments.sort(key=lambda x: x[2], reverse=True)
+
+    # Deduplicate: each member and each label assigned at most once
+    used_labels = set(speaker_map.keys())
+    used_members = set()
+    for label, info in speaker_map.items():
+        # Track the chair member as used
+        for m_name, m in last_names.items():
+            if m.get('name') == info.get('name'):
+                used_members.add(m_name)
+
+    for member_name, label, evidence in assignments:
+        if label in used_labels or member_name in used_members:
+            continue
+        member = last_names[member_name]
+        last = member['name'].split()[-1]
+
+        # Build display label
+        role = member.get('role', 'Member')
+        if role == 'Vice Chair':
+            display = f'Vice Chair {last}'
+        elif role == 'Chair':
+            display = f'Chair {last}'
+        elif member.get('chamber') == 'House':
+            display = f'Rep. {last}'
+        elif member.get('chamber') == 'Senate':
+            display = f'Sen. {last}'
+        else:
+            display = last
+
+        speaker_map[label] = {
+            'name': member['name'],
+            'display': display,
+            'evidence': evidence,
+        }
+        used_labels.add(label)
+        used_members.add(member_name)
+
+    # Merge non-member identifications (members always take priority)
+    for label, info in nonmember_map.items():
+        if label not in speaker_map:
+            speaker_map[label] = info
+
+    return speaker_map
 
 
 def resolve_media_url(clip_id, cache_manager=None):

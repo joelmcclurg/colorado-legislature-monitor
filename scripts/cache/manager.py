@@ -65,8 +65,19 @@ class CacheManager:
         return {}
 
     def _save_metadata(self):
-        """Save cache metadata to disk."""
+        """Save cache metadata to disk, merging with any concurrent changes."""
         try:
+            # Reload from disk to pick up writes from parallel processes
+            if self.metadata_file.exists():
+                try:
+                    with open(self.metadata_file, 'r') as f:
+                        disk_metadata = json.load(f)
+                    # Merge: our in-memory entries take precedence, but keep
+                    # entries written by other processes that we don't have
+                    disk_metadata.update(self.metadata)
+                    self.metadata = disk_metadata
+                except (json.JSONDecodeError, IOError):
+                    pass
             with open(self.metadata_file, 'w') as f:
                 json.dump(self.metadata, f, indent=2)
         except IOError as e:
