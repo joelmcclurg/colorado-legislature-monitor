@@ -928,10 +928,11 @@ def cmd_report(args):
 
     try:
         # Build query string preserving quoted phrases
-        # Re-quote multi-word args (shell strips quotes before argparse sees them)
+        # Re-quote multi-word args only if they don't already contain quotes
+        # (shell strips outer quotes but inner quotes survive)
         parts = []
         for kw in args.keywords:
-            if ' ' in kw:
+            if ' ' in kw and '"' not in kw:
                 parts.append(f'"{kw}"')
             else:
                 parts.append(kw)
