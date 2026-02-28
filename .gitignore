@@ -1,6 +1,9 @@
 # Cache directory
 data/
 
+# Allow public directory (Vercel static site)
+!public/
+
 # Python
 __pycache__/
 *.py[cod]

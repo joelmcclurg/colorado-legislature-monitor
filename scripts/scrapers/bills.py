@@ -7,18 +7,193 @@ Fetches and parses bill information from colorado.leg.gov including:
 - Detailed bill information (sponsors, committees, status)
 - Bill text versions, amendments, fiscal notes
 - Vote history
+
+Updated Feb 2026: Uses POST-based Turbo Stream search (site redesigned from
+static pages to Hotwire/Turbo Streams).
 """
 import re
 import requests
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
 from bs4 import BeautifulSoup
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from .sessions import get_current_session
 from .pdf_extractor import extract_pdf_text, batch_extract_pdfs
 
+# Suppress SSL warnings for leg.colorado.gov
+urllib3.disable_warnings(InsecureRequestWarning)
 
 BASE_URL = "https://leg.colorado.gov"
 BILLS_SEARCH_URL = f"{BASE_URL}/bills/bill-search"
+SEARCH_FORM_URL = f"{BASE_URL}/bill-search"
+
+
+def _session_code_to_name(session_code: str) -> str:
+    """
+    Convert session code to the display name used by the search form.
+
+    Args:
+        session_code: e.g. '2026A'
+
+    Returns:
+        Display name e.g. '2026 Regular Session'
+    """
+    if not session_code or len(session_code) < 4:
+        return f"{datetime.now().year} Regular Session"
+    year = session_code[:4]
+    suffix = session_code[4:] if len(session_code) > 4 else 'A'
+    if suffix == 'B':
+        return f"{year} Second Session"
+    return f"{year} Regular Session"
+
+
+def _fetch_turbo_search_results(
+    session_name: str,
+    query: Optional[str] = None,
+    sort: str = 'Bill # Ascending',
+    max_pages: int = 20
+) -> List[Dict[str, Any]]:
+    """
+    Fetch bill results via the Turbo Stream POST-based search.
+
+    The redesigned leg.colorado.gov uses Hotwire Turbo Streams. Bill search
+    requires: GET /bill-search (CSRF + cookies) → POST /bills/bill-search.
+
+    Args:
+        session_name: Session display name (e.g. '2026 Regular Session')
+        query: Optional search query string
+        sort: Sort order (e.g. 'Bill # Ascending', 'Most Relevant')
+        max_pages: Safety limit on pagination
+
+    Returns:
+        List of bill dicts
+    """
+    # Step 1: GET the search form for CSRF token + session cookies
+    try:
+        form_resp = requests.get(SEARCH_FORM_URL, verify=False, timeout=30)
+        form_resp.raise_for_status()
+    except requests.RequestException as e:
+        raise Exception(f"Failed to load bill search form: {e}")
+
+    form_soup = BeautifulSoup(form_resp.text, 'html.parser')
+    token_input = form_soup.find('input', {'name': 'authenticity_token'})
+    if not token_input:
+        raise Exception("Could not find CSRF token on bill search page")
+    csrf_token = token_input['value']
+    cookies = form_resp.cookies
+
+    # Step 2: Paginate through POST results
+    all_bills = []
+    seen_numbers = set()
+
+    for page in range(1, max_pages + 1):
+        post_data = {
+            'authenticity_token': csrf_token,
+            'sessions[]': session_name,
+            'sort': sort,
+            'page': str(page),
+        }
+        if query:
+            post_data['q'] = query
+
+        try:
+            resp = requests.post(
+                BILLS_SEARCH_URL,
+                data=post_data,
+                headers={'Accept': 'text/vnd.turbo-stream.html, text/html'},
+                cookies=cookies,
+                verify=False,
+                timeout=30
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            raise Exception(f"Failed to fetch bill search results (page {page}): {e}")
+
+        # Step 3: Extract content from <template> tags (BS4 doesn't traverse these)
+        templates = re.findall(r'<template>(.*?)</template>', resp.text, re.DOTALL)
+        page_bills = []
+
+        for tmpl in templates:
+            if 'bill-result' not in tmpl:
+                continue
+            inner_soup = BeautifulSoup(tmpl, 'html.parser')
+            results = inner_soup.find_all('div', class_='bill-result')
+            for div in results:
+                bill = _parse_bill_result_div(div)
+                if bill and bill['bill_number'] not in seen_numbers:
+                    seen_numbers.add(bill['bill_number'])
+                    page_bills.append(bill)
+
+        if not page_bills:
+            break
+
+        all_bills.extend(page_bills)
+
+        # If we got fewer than ~20 results, we're on the last page
+        if len(page_bills) < 20:
+            break
+
+    return all_bills
+
+
+def _parse_bill_result_div(div) -> Optional[Dict[str, Any]]:
+    """
+    Parse a single div.bill-result into a bill dict.
+
+    Expected structure:
+        <div class="bill-result">
+            <h2>HB26-1190</h2>
+            <h3><a href="/bills/hb26-1190">Title...</a></h3>
+            <span class="last-action">...</span>
+            <span class="sponsors">...</span>
+            <span class="subjects">...</span>
+        </div>
+    """
+    bill = {
+        'bill_number': None,
+        'title': None,
+        'url': None,
+        'last_action': None,
+        'subjects': [],
+        'sponsors': []
+    }
+
+    # Bill number from h2
+    h2 = div.find('h2')
+    if not h2:
+        return None
+    bill['bill_number'] = h2.get_text(strip=True).upper()
+
+    # Title + URL from h3 > a
+    h3 = div.find('h3')
+    if h3:
+        link = h3.find('a')
+        if link:
+            bill['title'] = link.get_text(strip=True)
+            href = link.get('href', '')
+            bill['url'] = f"{BASE_URL}{href}" if href.startswith('/') else href
+
+    # Last action
+    last_action_el = div.find('span', class_=re.compile(r'last.?action', re.I))
+    if last_action_el:
+        bill['last_action'] = last_action_el.get_text(strip=True)
+
+    # Sponsors
+    sponsors_el = div.find('span', class_=re.compile(r'sponsor', re.I))
+    if sponsors_el:
+        text = sponsors_el.get_text(strip=True)
+        if text:
+            bill['sponsors'] = [s.strip() for s in text.split(',') if s.strip()]
+
+    # Subjects
+    subjects_el = div.find('span', class_=re.compile(r'subject', re.I))
+    if subjects_el:
+        text = subjects_el.get_text(strip=True)
+        if text:
+            bill['subjects'] = [s.strip() for s in text.split(',') if s.strip()]
+
+    return bill
 
 
 def list_bills(
@@ -32,6 +207,9 @@ def list_bills(
 ) -> List[Dict[str, Any]]:
     """
     List bills with optional filtering.
+
+    Uses POST-based Turbo Stream search to get full bill listings from the
+    redesigned leg.colorado.gov (Feb 2026+).
 
     Args:
         session: Session code (e.g., '2026A'). Defaults to current session.
@@ -48,82 +226,45 @@ def list_bills(
     if not session:
         session = get_current_session()
 
-    # Check cache
-    cache_key = f"bills_list_{session}_{chamber}_{bill_type}_{limit}"
+    # Check cache — cache the full unfiltered result so filters are instant
+    cache_key = f"bills_turbo_{session}"
+    all_bills = None
     if cache_manager:
-        cached = cache_manager.get(cache_key, max_age_hours=6)
-        if cached:
-            return cached
+        all_bills = cache_manager.get(cache_key, max_age_hours=6)
 
-    # Fetch main bills page
-    # The search interface uses dynamic loading, so we scrape from the main bills page
-    url = f"{BASE_URL}/bills"
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        raise Exception(f"Failed to fetch bills: {e}")
+    if not all_bills:
+        session_name = _session_code_to_name(session)
+        all_bills = _fetch_turbo_search_results(session_name)
 
-    soup = BeautifulSoup(response.text, 'html.parser')
+        # Cache full result
+        if cache_manager and all_bills:
+            cache_manager.set(cache_key, all_bills, subdirectory='bills')
 
-    # Find all bill links
-    # Extract year suffix from session (2026A -> 26)
-    # Session format is usually YYYYA where YYYY is the year
-    if session and len(session) >= 4:
-        year_suffix = session[2:4]  # "2026A" -> "26"
-    else:
-        year_suffix = '26'
+    # Apply client-side filters
+    bills = all_bills
+    if chamber:
+        bills = [b for b in bills if (
+            (chamber == 'House' and b['bill_number'].startswith('H')) or
+            (chamber == 'Senate' and b['bill_number'].startswith('S'))
+        )]
+    if bill_type:
+        type_prefix_map = {
+            'Bill': ['HB', 'SB'],
+            'Resolution': ['HR', 'SR', 'HJR', 'SJR'],
+            'Memorial': ['HM', 'SM', 'HJM', 'SJM'],
+            'Concurrent Resolution': ['HCR', 'SCR'],
+        }
+        prefixes = type_prefix_map.get(bill_type, [])
+        if prefixes:
+            bills = [b for b in bills if any(b['bill_number'].startswith(p) for p in prefixes)]
+    if sponsor:
+        sponsor_lower = sponsor.lower()
+        bills = [b for b in bills if any(sponsor_lower in s.lower() for s in b.get('sponsors', []))]
+    if subject:
+        subject_lower = subject.lower()
+        bills = [b for b in bills if any(subject_lower in s.lower() for s in b.get('subjects', []))]
 
-    bills = []
-    # Pattern: /bills/hb26-1001 or /bills/sb26-004 or /bills/hjr26-001, etc.
-    bill_links = soup.find_all('a', href=re.compile(rf'/bills/[hs][bcjm][rm]?{year_suffix}-\d+', re.I))
-
-    for link in bill_links:
-        bill_url = link.get('href', '')
-        if not bill_url:
-            continue
-
-        # Extract bill number from URL
-        bill_match = re.search(r'([hs][bcjm][rm]?\d+-\d+)', bill_url, re.I)
-        if not bill_match:
-            continue
-
-        bill_number = bill_match.group(1).upper()
-
-        # Apply chamber filter
-        if chamber:
-            if chamber == 'House' and not bill_number.startswith('H'):
-                continue
-            elif chamber == 'Senate' and not bill_number.startswith('S'):
-                continue
-
-        # Get bill title from link text or nearby text
-        title = link.text.strip()
-        # Remove bill number from title if present
-        title = re.sub(r'^[HS][BCRJM]+\d+-\d+\s*', '', title, flags=re.I)
-
-        # Check for duplicates
-        if any(b['bill_number'] == bill_number for b in bills):
-            continue
-
-        bills.append({
-            'bill_number': bill_number,
-            'title': title if title else None,
-            'url': f"{BASE_URL}{bill_url}" if bill_url.startswith('/') else bill_url,
-            'last_action': None,
-            'subjects': [],
-            'sponsors': []
-        })
-
-        # Stop if we've hit the limit
-        if len(bills) >= limit:
-            break
-
-    # Cache result
-    if cache_manager:
-        cache_manager.set(cache_key, bills, subdirectory='bills')
-
-    return bills
+    return bills[:limit]
 
 
 def get_bill_info(
@@ -342,7 +483,7 @@ def search_bills(
     cache_manager=None
 ) -> List[Dict[str, Any]]:
     """
-    Search bills by keyword.
+    Search bills by keyword using Turbo Stream POST search.
 
     Args:
         query: Search query string
@@ -357,131 +498,23 @@ def search_bills(
     if not session:
         session = get_current_session()
 
-    # Build search parameters
-    params = {
-        f'field_sessions[{session}]': session,
-        'combine': query,
-        'sort_bef_combine': 'search_api_relevance DESC',
-        'page': 0
-    }
+    session_name = _session_code_to_name(session)
 
+    # Use relevance sort for keyword searches
+    bills = _fetch_turbo_search_results(
+        session_name,
+        query=query,
+        sort='Most Relevant'
+    )
+
+    # Apply chamber filter client-side
     if chamber:
-        params['field_chamber'] = chamber
-
-    bills = []
-    page = 0
-
-    while len(bills) < limit:
-        params['page'] = page
-
-        try:
-            response = requests.get(BILLS_SEARCH_URL, params=params, timeout=30)
-            response.raise_for_status()
-        except requests.RequestException as e:
-            raise Exception(f"Failed to search bills: {e}")
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        page_bills = _extract_bills_from_search(soup)
-
-        if not page_bills:
-            break
-
-        bills.extend(page_bills)
-
-        if len(page_bills) < 25:
-            break
-
-        page += 1
+        bills = [b for b in bills if (
+            (chamber == 'House' and b['bill_number'].startswith('H')) or
+            (chamber == 'Senate' and b['bill_number'].startswith('S'))
+        )]
 
     return bills[:limit]
-
-
-def _extract_bills_from_search(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    """
-    Extract bill information from search results page.
-
-    Args:
-        soup: BeautifulSoup object of search results page
-
-    Returns:
-        List of bill dicts with basic information
-    """
-    bills = []
-
-    # Find all bill result items
-    result_items = soup.find_all('div', class_=re.compile(r'views-row'))
-
-    for item in result_items:
-        bill = {
-            'bill_number': None,
-            'title': None,
-            'long_title': None,
-            'url': None,
-            'last_action': None,
-            'subjects': [],
-            'sponsors': []
-        }
-
-        # Extract bill number and title from h3
-        heading = item.find('h3')
-        if heading:
-            link = heading.find('a')
-            if link:
-                # Bill number is typically at the start
-                text = heading.text.strip()
-                # Extract bill number pattern
-                bill_match = re.search(r'([HS][BCJM][JR]*\d+-\d+)', text, re.I)
-                if bill_match:
-                    bill['bill_number'] = bill_match.group(1).upper()
-
-                # Title is the link text (minus bill number)
-                title = link.text.strip()
-                title = re.sub(r'^[HS][BCJM][JR]*\d+-\d+\s*', '', title, flags=re.I)
-                bill['title'] = title
-
-                # URL
-                href = link.get('href', '')
-                bill['url'] = f"{BASE_URL}{href}" if href.startswith('/') else href
-
-        # Extract long title
-        long_title = item.find('div', class_=re.compile(r'field.*long'))
-        if long_title:
-            bill['long_title'] = long_title.text.strip()
-
-        # Extract last action
-        last_action = item.find(text=re.compile(r'LAST ACTION:'))
-        if last_action:
-            parent = last_action.find_parent()
-            if parent:
-                action_text = parent.text.replace('LAST ACTION:', '').strip()
-                bill['last_action'] = action_text
-
-        # Extract subjects
-        subjects_section = item.find(text=re.compile(r'SUBJECTS:'))
-        if subjects_section:
-            parent = subjects_section.find_parent()
-            if parent:
-                subject_links = parent.find_all('a')
-                for link in subject_links:
-                    subject = link.text.strip()
-                    if subject:
-                        bill['subjects'].append(subject)
-
-        # Extract sponsors
-        sponsors_section = item.find(text=re.compile(r'SPONSORS:'))
-        if sponsors_section:
-            parent = sponsors_section.find_parent()
-            if parent:
-                sponsor_links = parent.find_all('a', href=re.compile(r'/legislators/'))
-                for link in sponsor_links:
-                    sponsor = link.text.strip()
-                    if sponsor:
-                        bill['sponsors'].append(sponsor)
-
-        if bill['bill_number']:
-            bills.append(bill)
-
-    return bills
 
 
 def _extract_sponsors(soup: BeautifulSoup) -> List[Dict[str, str]]:
