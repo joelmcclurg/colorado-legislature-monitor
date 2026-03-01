@@ -213,11 +213,13 @@ def load_transcripts():
         if not clip_id:
             continue
         utts = t.get('utterances', [])
+        # Check for real content: either multiple utterances OR substantial text
+        has_content = len(utts) > 1 or len(t.get('text', '')) > 500
         transcripts[clip_id] = {
             'utterance_count': len(utts),
             'speaker_count': t.get('speaker_count', 0),
             'transcribed_at': t.get('transcribed_at', ''),
-            'has_transcript': len(utts) > 1,
+            'has_transcript': has_content,
         }
 
     return transcripts
@@ -246,18 +248,27 @@ def build_transcript_index(output_path):
             t = json.load(fh)
         clip_id = t.get('clip_id', '')
         utts = t.get('utterances', [])
-        if len(utts) <= 5:
+        full_text = t.get('text', '')
+
+        # Skip if no real content
+        if len(utts) <= 1 and len(full_text) < 500:
             continue
 
         rec = rec_map.get(clip_id, {})
-        entry = {
-            'clip_id': clip_id,
-            'committee': rec.get('committee', ''),
-            'committee_name': rec.get('committee_name', ''),
-            'date': rec.get('date', ''),
-            'title': rec.get('title', clip_id),
-            'video_url': rec.get('video_url', ''),
-            'utterances': [
+
+        # For single-utterance transcripts (diarization failed), chunk the
+        # full text into ~500-char segments so search can find matches
+        if len(utts) <= 1 and len(full_text) >= 500:
+            chunks = []
+            for i in range(0, len(full_text), 500):
+                chunks.append({
+                    'speaker': '?',
+                    'text': full_text[i:i+500],
+                    'start': 0,
+                })
+            indexed_utts = chunks
+        else:
+            indexed_utts = [
                 {
                     'speaker': u.get('speaker', '?'),
                     'text': u.get('text', '')[:500],
@@ -265,6 +276,15 @@ def build_transcript_index(output_path):
                 }
                 for u in utts
             ]
+
+        entry = {
+            'clip_id': clip_id,
+            'committee': rec.get('committee', ''),
+            'committee_name': rec.get('committee_name', ''),
+            'date': rec.get('date', ''),
+            'title': rec.get('title', clip_id),
+            'video_url': rec.get('video_url', ''),
+            'utterances': indexed_utts,
         }
         index.append(entry)
 
