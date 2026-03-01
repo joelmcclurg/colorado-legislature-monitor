@@ -16,16 +16,23 @@ Usage:
 import argparse
 import json
 import html
+import re
 import sys
 import os
 import glob
 import subprocess
 import warnings
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
 
 # Suppress SSL warnings
 warnings.filterwarnings('ignore', message='urllib3 v2 only supports OpenSSL')
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -35,6 +42,139 @@ from scrapers.bills import list_bills
 from scrapers.sessions import get_current_session
 
 DATA_DIR = Path(__file__).parent.parent / 'data'
+BILL_SUMMARIES_DIR = DATA_DIR / 'bill_summaries'
+BASE_URL = "https://leg.colorado.gov"
+SUMMARY_CACHE_HOURS = 24
+
+
+def _fetch_one_bill_summary(bill_number, bill_url):
+    """Fetch long title + summary for a single bill from its detail page.
+
+    Returns dict with bill_number, long_title, summary, or None on failure.
+    """
+    url = bill_url or f"{BASE_URL}/bills/{bill_number.lower()}"
+    try:
+        resp = requests.get(url, timeout=20, verify=False)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+
+    long_title = ''
+    lt_elem = soup.find('p', class_='bill-long-title')
+    if lt_elem:
+        long_title = lt_elem.get_text(strip=True)
+
+    summary = ''
+    sw = soup.find('div', class_='bill-detail-bill-summary-wrapper')
+    if sw:
+        summary = sw.get_text(strip=True)
+        # Remove heading and trailing note
+        summary = summary.replace('Bill Summary:', '').strip()
+        summary = re.sub(r'\(Note:.*?\)$', '', summary).strip()
+
+    if not long_title and not summary:
+        return None
+
+    return {
+        'bill_number': bill_number,
+        'long_title': long_title,
+        'summary': summary,
+    }
+
+
+def fetch_bill_summaries(bills, max_workers=10):
+    """Fetch bill summaries for all bills, using a 24h file cache.
+
+    Args:
+        bills: List of bill dicts (from list_bills) with bill_number, url
+        max_workers: Thread pool size for parallel fetching
+
+    Returns:
+        list of {bill_number, long_title, summary} dicts
+    """
+    BILL_SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = datetime.now() - timedelta(hours=SUMMARY_CACHE_HOURS)
+    results = []
+    to_fetch = []  # (bill_number, url, cache_path)
+
+    for b in bills:
+        bn = b['bill_number']
+        cache_path = BILL_SUMMARIES_DIR / f"{bn}.json"
+        if cache_path.exists():
+            mtime = datetime.fromtimestamp(cache_path.stat().st_mtime)
+            if mtime > cutoff:
+                try:
+                    data = json.loads(cache_path.read_text())
+                    results.append(data)
+                    continue
+                except (json.JSONDecodeError, IOError):
+                    pass
+        to_fetch.append((bn, b.get('url', ''), cache_path))
+
+    if not to_fetch:
+        return results
+
+    print(f"  Fetching {len(to_fetch)} bill summaries ({len(bills) - len(to_fetch)} cached)...")
+
+    def _worker(item):
+        bn, url, cache_path = item
+        data = _fetch_one_bill_summary(bn, url)
+        if data:
+            try:
+                cache_path.write_text(json.dumps(data, ensure_ascii=False))
+            except IOError:
+                pass
+        return data
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_worker, item): item for item in to_fetch}
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            if done % 50 == 0:
+                print(f"    {done}/{len(to_fetch)} fetched...")
+            data = future.result()
+            if data:
+                results.append(data)
+
+    return results
+
+
+def build_bill_text_index(bills, summaries, output_path):
+    """Build bills_text.json search index from bill summaries.
+
+    Args:
+        bills: List of bill dicts (from list_bills)
+        summaries: List of summary dicts (from fetch_bill_summaries)
+        output_path: Path to write bills_text.json
+
+    Returns:
+        int: Number of bills indexed
+    """
+    summary_map = {s['bill_number']: s for s in summaries}
+    index = []
+    for b in bills:
+        bn = b['bill_number']
+        s = summary_map.get(bn, {})
+        entry = {
+            'bill_number': bn,
+            'title': b.get('title', ''),
+            'long_title': s.get('long_title', ''),
+            'summary': s.get('summary', ''),
+            'sponsors': b.get('sponsors', []),
+            'subjects': b.get('subjects', []),
+            'url': b.get('url', f'{BASE_URL}/bills/{bn.lower()}'),
+        }
+        # Only include if we have some searchable text beyond the title
+        if entry['long_title'] or entry['summary']:
+            index.append(entry)
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(index, ensure_ascii=False), encoding='utf-8')
+    return len(index)
 
 
 def load_recordings():
@@ -187,6 +327,14 @@ def build_dashboard(output_path: str, session: str = None):
     idx_count = build_transcript_index(transcript_index_path)
     print(f"  {idx_count} transcripts indexed")
 
+    # --- Bill summaries search index ---
+    bill_text_index_path = str(Path(output_path).parent / 'bills_text.json')
+    print("Fetching bill summaries...")
+    summaries = fetch_bill_summaries(bills)
+    print(f"  {len(summaries)} summaries fetched")
+    bill_idx_count = build_bill_text_index(bills, summaries, bill_text_index_path)
+    print(f"  {bill_idx_count} bills indexed in bills_text.json")
+
     # --- Generate HTML ---
     bills_json = json.dumps(bills, ensure_ascii=False)
     recordings_json = json.dumps(recordings, ensure_ascii=False)
@@ -213,8 +361,10 @@ def build_dashboard(output_path: str, session: str = None):
     out.write_text(html_content, encoding='utf-8')
 
     idx_size = os.path.getsize(transcript_index_path) if os.path.exists(transcript_index_path) else 0
+    bill_idx_size = os.path.getsize(bill_text_index_path) if os.path.exists(bill_text_index_path) else 0
     print(f"Dashboard: {out} ({len(html_content):,} bytes)")
-    print(f"Index: {transcript_index_path} ({idx_size:,} bytes)")
+    print(f"Transcript index: {transcript_index_path} ({idx_size:,} bytes)")
+    print(f"Bill text index: {bill_text_index_path} ({bill_idx_size:,} bytes)")
     return str(out)
 
 
@@ -749,6 +899,8 @@ renderHearings();
 
 // ===== SEARCH TAB =====
 let transcriptLoading = false;
+let billTextIndex = null;
+let billTextLoading = false;
 
 function loadTranscriptIndex() {{
   if (transcriptIndex) return Promise.resolve(transcriptIndex);
@@ -762,6 +914,32 @@ function loadTranscriptIndex() {{
     .then(r => r.json())
     .then(data => {{ transcriptIndex = data; transcriptLoading = false; return data; }})
     .catch(() => {{ transcriptIndex = []; transcriptLoading = false; return []; }});
+}}
+
+function loadBillTextIndex() {{
+  if (billTextIndex) return Promise.resolve(billTextIndex);
+  if (billTextLoading) return new Promise(resolve => {{
+    const check = setInterval(() => {{
+      if (billTextIndex) {{ clearInterval(check); resolve(billTextIndex); }}
+    }}, 100);
+  }});
+  billTextLoading = true;
+  return fetch('bills_text.json')
+    .then(r => r.json())
+    .then(data => {{ billTextIndex = data; billTextLoading = false; return data; }})
+    .catch(() => {{ billTextIndex = []; billTextLoading = false; return []; }});
+}}
+
+function highlightSnippet(text, query, contextChars) {{
+  const q = query.toLowerCase();
+  const idx = text.toLowerCase().indexOf(q);
+  if (idx < 0) return null;
+  const start = Math.max(0, idx - contextChars);
+  const end = Math.min(text.length, idx + q.length + contextChars);
+  let snippet = (start > 0 ? '...' : '') + text.substring(start, end) + (end < text.length ? '...' : '');
+  const escaped = query.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&');
+  snippet = snippet.replace(new RegExp('(' + escaped + ')', 'gi'), '<mark>$1</mark>');
+  return snippet;
 }}
 
 let globalSearchTimer = null;
@@ -779,31 +957,75 @@ function doGlobalSearch(query) {{
   status.className = 'search-status loading';
 
   const q = query.toLowerCase();
-  let html = '';
 
-  // Search bills (client-side)
-  const billMatches = BILLS.filter(b => {{
-    const hay = [b.bill_number, b.title||'', (b.sponsors||[]).join(' '), (b.subjects||[]).join(' ')].join(' ').toLowerCase();
-    return hay.includes(q);
-  }}).slice(0, 20);
+  // Load both indexes in parallel, then render
+  Promise.all([loadBillTextIndex(), loadTranscriptIndex()]).then(([billIdx, transcriptIdx]) => {{
+    let html = '';
 
-  if (billMatches.length) {{
-    html += '<div class="search-section"><h3><span class="badge badge-bill">Bills</span> '+billMatches.length+' matches</h3>';
-    billMatches.forEach(b => {{
-      const url = b.url || 'https://leg.colorado.gov/bills/'+b.bill_number.toLowerCase();
-      const title = b.title || '';
-      html += '<div class="search-result type-bill">'+
-        '<div class="sr-title"><a href="'+esc(url)+'" target="_blank">'+esc(b.bill_number)+'</a> &mdash; '+esc(title)+'</div>'+
-        '<div class="sr-meta">'+(b.sponsors||[]).join(', ')+'</div>'+
-        '</div>';
-    }});
-    html += '</div>';
-  }}
+    // --- Search bills: title + long_title + summary ---
+    const billMatches = [];
+    const seenBills = new Set();
 
-  // Search transcripts (lazy-load index)
-  loadTranscriptIndex().then(index => {{
+    // First search the bill text index (has summaries)
+    for (const b of billIdx) {{
+      const hay = [b.bill_number, b.title||'', b.long_title||'', b.summary||'',
+                   (b.sponsors||[]).join(' '), (b.subjects||[]).join(' ')].join(' ').toLowerCase();
+      if (hay.includes(q)) {{
+        seenBills.add(b.bill_number);
+        billMatches.push(b);
+      }}
+      if (billMatches.length >= 30) break;
+    }}
+
+    // Also search BILLS array for any not in bill text index
+    if (billMatches.length < 30) {{
+      for (const b of BILLS) {{
+        if (seenBills.has(b.bill_number)) continue;
+        const hay = [b.bill_number, b.title||'', (b.sponsors||[]).join(' '), (b.subjects||[]).join(' ')].join(' ').toLowerCase();
+        if (hay.includes(q)) {{
+          billMatches.push({{
+            bill_number: b.bill_number,
+            title: b.title||'',
+            long_title: '',
+            summary: '',
+            sponsors: b.sponsors||[],
+            subjects: b.subjects||[],
+            url: b.url||'',
+          }});
+        }}
+        if (billMatches.length >= 30) break;
+      }}
+    }}
+
+    if (billMatches.length) {{
+      html += '<div class="search-section"><h3><span class="badge badge-bill">Bills</span> ' + billMatches.length + ' matches</h3>';
+      billMatches.forEach(b => {{
+        const url = b.url || 'https://leg.colorado.gov/bills/' + b.bill_number.toLowerCase();
+        const title = b.title || '';
+
+        html += '<div class="search-result type-bill">' +
+          '<div class="sr-title"><a href="' + esc(url) + '" target="_blank">' + esc(b.bill_number) + '</a> &mdash; ' + esc(title) + '</div>' +
+          '<div class="sr-meta">' + esc((b.sponsors || []).join(', ')) + '</div>';
+
+        // Show context snippet from summary or long_title
+        let snippet = null;
+        if (b.summary) snippet = highlightSnippet(b.summary, query, 120);
+        if (!snippet && b.long_title) snippet = highlightSnippet(b.long_title, query, 120);
+        if (snippet) {{
+          html += '<div class="sr-context">' + snippet + '</div>';
+        }} else if (b.summary) {{
+          // No match in summary text but matched on title/sponsor/etc — show first 200 chars
+          html += '<div class="sr-context">' + esc(b.summary.substring(0, 200)) + (b.summary.length > 200 ? '...' : '') + '</div>';
+        }}
+
+        html += '</div>';
+      }});
+      html += '</div>';
+    }}
+
+    // --- Search transcripts ---
     const hearingMatches = [];
-    for (const t of index) {{
+    for (const t of transcriptIdx) {{
       const matches = [];
       for (const u of t.utterances) {{
         if (u.text.toLowerCase().includes(q)) {{
@@ -818,58 +1040,26 @@ function doGlobalSearch(query) {{
     }}
 
     if (hearingMatches.length) {{
-      html += '<div class="search-section"><h3><span class="badge badge-hearing">Hearings</span> '+hearingMatches.length+' recordings with matches</h3>';
+      html += '<div class="search-section"><h3><span class="badge badge-hearing">Hearings</span> ' + hearingMatches.length + ' recordings with matches</h3>';
       hearingMatches.forEach(h => {{
         const vidUrl = h.video_url || '#';
-        html += '<div class="search-result type-hearing">'+
-          '<div class="sr-title"><a href="'+esc(vidUrl)+'" target="_blank">'+esc(h.title||h.clip_id)+'</a></div>'+
-          '<div class="sr-meta">'+esc(h.committee_name||'')+' &middot; '+esc(h.date||'')+'</div>'+
+        html += '<div class="search-result type-hearing">' +
+          '<div class="sr-title"><a href="' + esc(vidUrl) + '" target="_blank">' + esc(h.title || h.clip_id) + '</a></div>' +
+          '<div class="sr-meta">' + esc(h.committee_name || '') + ' &middot; ' + esc(h.date || '') + '</div>' +
           '<div class="sr-context">';
         h.matches.forEach(u => {{
-          const text = u.text;
-          const idx = text.toLowerCase().indexOf(q);
-          const start = Math.max(0, idx-80);
-          const end = Math.min(text.length, idx+q.length+80);
-          let snippet = (start>0?'...':'') + text.substring(start,end) + (end<text.length?'...':'');
-          // Highlight
-          snippet = snippet.replace(new RegExp('('+query.replace(/[.*+?^${{}}()|[\\]\\\\]/g,'\\\\$&')+')','gi'), '<mark>$1</mark>');
-          html += '<div style="margin-bottom:4px"><span class="utt-time">'+fmtMs(u.start)+'</span> <span class="utt-speaker">Speaker '+esc(u.speaker)+'</span> '+snippet+'</div>';
+          const snippet = highlightSnippet(u.text, query, 80) || esc(u.text.substring(0, 160));
+          html += '<div style="margin-bottom:4px"><span class="utt-time">' + fmtMs(u.start) + '</span> <span class="utt-speaker">Speaker ' + esc(u.speaker) + '</span> ' + snippet + '</div>';
         }});
         html += '</div></div>';
       }});
       html += '</div>';
     }}
 
-    // Also fire bill API search
-    fetch('/api/search?q='+encodeURIComponent(query))
-      .then(r => r.ok ? r.json() : [])
-      .then(apiBills => {{
-        if (Array.isArray(apiBills) && apiBills.length) {{
-          const seen = new Set(billMatches.map(b=>b.bill_number));
-          const extra = apiBills.filter(b => !seen.has(b.bill_number)).slice(0,15);
-          if (extra.length) {{
-            html += '<div class="search-section"><h3><span class="badge badge-bill">Bills</span> '+extra.length+' additional full-text matches</h3>';
-            extra.forEach(b => {{
-              const url = b.url || 'https://leg.colorado.gov/bills/'+b.bill_number.toLowerCase();
-              html += '<div class="search-result type-bill">'+
-                '<div class="sr-title"><a href="'+esc(url)+'" target="_blank">'+esc(b.bill_number)+'</a> &mdash; '+esc(b.title||'')+'</div>'+
-                '<div class="sr-meta">'+(b.sponsors||[]).join(', ')+'</div>'+
-                '</div>';
-            }});
-            html += '</div>';
-          }}
-        }}
-        if (!html) html = '<div class="no-results">No results found for "'+esc(query)+'".</div>';
-        document.getElementById('searchResults').innerHTML = html;
-        status.textContent = '';
-        status.className = 'search-status';
-      }})
-      .catch(() => {{
-        if (!html) html = '<div class="no-results">No results found for "'+esc(query)+'".</div>';
-        document.getElementById('searchResults').innerHTML = html;
-        status.textContent = '';
-        status.className = 'search-status';
-      }});
+    if (!html) html = '<div class="no-results">No results found for "' + esc(query) + '".</div>';
+    document.getElementById('searchResults').innerHTML = html;
+    status.textContent = '';
+    status.className = 'search-status';
   }});
 }}
 
