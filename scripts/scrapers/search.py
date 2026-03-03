@@ -218,19 +218,24 @@ def _extract_transcript_context(transcript, pattern, max_matches=3):
     """
     Extract speaker-labeled context snippets from transcript utterances.
 
+    Uses stored speaker_map to replace generic labels with real names.
+
     Args:
         transcript: Transcript data dict with 'utterances' list
         pattern: Compiled regex pattern
         max_matches: Maximum number of matches to return
 
     Returns:
-        list: Context strings like "[Speaker A, 01:23:45] ...discussing **food assistance** programs..."
+        list: Context strings like "[Chair Morrow, 01:23:45] ...discussing **food assistance** programs..."
     """
     from scrapers.transcripts import format_timestamp
 
     utterances = transcript.get('utterances', [])
     if not utterances:
         return []
+
+    # Load stored speaker_map if available
+    speaker_map = transcript.get('speaker_map', {})
 
     contexts = []
     for utt in utterances:
@@ -241,9 +246,15 @@ def _extract_transcript_context(transcript, pattern, max_matches=3):
         if not pattern.search(text):
             continue
 
-        speaker = utt.get('speaker', '?')
+        raw_speaker = utt.get('speaker', '?')
         start_ms = utt.get('start', 0)
         timestamp = format_timestamp(start_ms)
+
+        # Resolve speaker label to real name
+        if raw_speaker in speaker_map:
+            display_name = speaker_map[raw_speaker].get('display', f'Speaker {raw_speaker}')
+        else:
+            display_name = f'Speaker {raw_speaker}'
 
         # Truncate long utterances around the match
         match = pattern.search(text)
@@ -263,7 +274,7 @@ def _extract_transcript_context(transcript, pattern, max_matches=3):
         # Clean up whitespace
         snippet = ' '.join(snippet.split())
 
-        contexts.append(f"[Speaker {speaker}, {timestamp}] {snippet}")
+        contexts.append(f"[{display_name}, {timestamp}] {snippet}")
 
     return contexts
 

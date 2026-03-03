@@ -28,7 +28,8 @@ from scrapers.committees import list_committees, get_committee_info, search_comm
 from scrapers.bills import list_bills, get_bill_info, search_bills, extract_bill_content
 from scrapers.transcripts import (
     transcribe_recording, get_transcript, list_transcribed_recordings,
-    batch_transcribe, estimate_cost, resolve_speakers, format_timestamp
+    batch_transcribe, estimate_cost, resolve_speakers, resolve_and_store_speakers,
+    format_timestamp
 )
 from scrapers.sliq import (
     PRIORITY_COMMITTEES, fetch_committee_recordings, fetch_all_priority_recordings
@@ -922,6 +923,136 @@ def cmd_transcript_status_all(args):
         return 1
 
 
+def cmd_transcript_resolve_speakers(args):
+    """Handle 'transcript resolve-speakers' command.
+
+    Iterates all cached transcripts, runs utterance splitting on poorly-diarized
+    ones, then resolves speaker labels to real names using committee member data.
+    """
+    cache = CacheManager()
+
+    try:
+        from processing.utterance_splitter import is_splitting_candidate, split_utterances
+
+        transcripts = list_transcribed_recordings(cache)
+        if not transcripts:
+            print("No transcripts found in cache.")
+            return 0
+
+        # Build a map from clip_id to committee code using recording metadata
+        clip_to_committee = {}
+        for code, info in PRIORITY_COMMITTEES.items():
+            category_id = info['category_id']
+            cache_key = f"sliq_recordings_{category_id}"
+            recordings = cache.get(cache_key, max_age_hours=None) or []
+            for rec in recordings:
+                cid = rec.get('clip_id', '')
+                if cid:
+                    clip_to_committee[cid] = code
+
+        # Also check Granicus JBC recordings
+        granicus_recordings = cache.get('jbc_recordings', max_age_hours=None) or []
+        for rec in granicus_recordings:
+            cid = rec.get('clip_id', '')
+            if cid:
+                clip_to_committee[cid] = 'JointBudgetCommittee'
+
+        # Cache committee member lookups to avoid repeated fetches
+        committee_members_cache = {}
+
+        total_processed = 0
+        total_speakers_resolved = 0
+        total_still_unresolved = 0
+        total_splits = 0
+
+        print("# Speaker Resolution")
+        print("")
+        print(f"Processing {len(transcripts)} transcripts...")
+        print("")
+
+        for t_info in transcripts:
+            clip_id = t_info.get('clip_id', '')
+            if not clip_id or t_info.get('error'):
+                continue
+
+            transcript = get_transcript(clip_id, cache)
+            if not transcript or transcript.get('error'):
+                continue
+
+            committee_code = clip_to_committee.get(clip_id)
+            if not committee_code:
+                print(f"  [{clip_id}] Skipped — no committee mapping found")
+                continue
+
+            # Strip _House/_Senate suffix for committee slug lookup
+            committee_slug = committee_code.replace('_House', '').replace('_Senate', '')
+
+            # Get committee members (cached)
+            if committee_slug not in committee_members_cache:
+                try:
+                    committee_info = get_committee_info(committee_slug, cache_manager=cache)
+                    if committee_info:
+                        committee_members_cache[committee_slug] = {
+                            'members': committee_info.get('members', []),
+                            'name': committee_info.get('name', committee_slug),
+                        }
+                    else:
+                        committee_members_cache[committee_slug] = {'members': [], 'name': committee_slug}
+                except Exception:
+                    committee_members_cache[committee_slug] = {'members': [], 'name': committee_slug}
+
+            members = committee_members_cache[committee_slug]['members']
+            committee_name = committee_members_cache[committee_slug]['name']
+
+            # Step 1: Run utterance splitting on poorly-diarized transcripts
+            split_stats = None
+            if is_splitting_candidate(transcript):
+                split_stats = split_utterances(transcript)
+                total_splits += split_stats.get('splits_made', 0)
+
+            # Step 2: Resolve speakers
+            speaker_map = resolve_and_store_speakers(
+                clip_id, committee_name, members, cache
+            )
+
+            resolved = sum(1 for v in speaker_map.values() if v.get('name'))
+            unique_speakers = set(u.get('speaker', '') for u in transcript.get('utterances', []))
+            unresolved = len(unique_speakers) - resolved
+
+            total_processed += 1
+            total_speakers_resolved += resolved
+            total_still_unresolved += max(0, unresolved)
+
+            # Report
+            status_parts = []
+            if split_stats and split_stats['splits_made'] > 0:
+                status_parts.append(
+                    f"split {split_stats['utterances_before']}→{split_stats['utterances_after']} utterances"
+                )
+            if resolved > 0:
+                names = [v['display'] for v in speaker_map.values() if v.get('display')]
+                status_parts.append(f"resolved {resolved}: {', '.join(names[:5])}")
+            if not status_parts:
+                status_parts.append("no speakers resolved")
+
+            print(f"  [{clip_id}] {'; '.join(status_parts)}")
+
+        print("")
+        print("## Summary")
+        print(f"- **Transcripts processed:** {total_processed}")
+        print(f"- **Speakers resolved:** {total_speakers_resolved}")
+        print(f"- **Still unresolved:** {total_still_unresolved}")
+        if total_splits > 0:
+            print(f"- **Utterance splits:** {total_splits}")
+        return 0
+
+    except Exception as e:
+        print(format_error(f"Error resolving speakers: {str(e)}"))
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
 def cmd_report(args):
     """Handle 'report' command - generate advocacy HTML report."""
     cache = CacheManager()
@@ -1416,6 +1547,12 @@ Examples:
     # transcript status
     transcript_subparsers.add_parser('status', help='Show transcript status for all recordings')
 
+    # transcript resolve-speakers
+    transcript_subparsers.add_parser(
+        'resolve-speakers',
+        help='Batch resolve speaker labels to real names in all cached transcripts'
+    )
+
     # Report command (advocacy HTML report)
     report_parser = subparsers.add_parser('report', help='Generate advocacy HTML report')
     report_parser.add_argument('keywords', nargs='+', help='Search keywords (quote phrases: "Nutrition Assistance")')
@@ -1508,6 +1645,8 @@ Examples:
             return cmd_transcript_list(args)
         elif args.transcript_command == 'status':
             return cmd_transcript_status_all(args)
+        elif args.transcript_command == 'resolve-speakers':
+            return cmd_transcript_resolve_speakers(args)
         else:
             transcript_parser.print_help()
             return 1

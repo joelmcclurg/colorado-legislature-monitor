@@ -258,6 +258,9 @@ def build_transcript_index(output_path):
 
         # For single-utterance transcripts (diarization failed), chunk the
         # full text into ~500-char segments so search can find matches
+        # Load speaker_map if available
+        speaker_map = t.get('speaker_map', {})
+
         if len(utts) <= 1 and len(full_text) >= 500:
             chunks = []
             for i in range(0, len(full_text), 500):
@@ -268,14 +271,17 @@ def build_transcript_index(output_path):
                 })
             indexed_utts = chunks
         else:
-            indexed_utts = [
-                {
-                    'speaker': u.get('speaker', '?'),
+            indexed_utts = []
+            for u in utts:
+                raw_speaker = u.get('speaker', '?')
+                display_speaker = raw_speaker
+                if raw_speaker in speaker_map:
+                    display_speaker = speaker_map[raw_speaker].get('display', raw_speaker)
+                indexed_utts.append({
+                    'speaker': display_speaker,
                     'text': u.get('text', '')[:500],
                     'start': u.get('start', 0),
-                }
-                for u in utts
-            ]
+                })
 
         entry = {
             'clip_id': clip_id,
@@ -898,11 +904,13 @@ function renderHearings() {{
         td.colSpan = 6;
         const utts = t.utterances.slice(0, 15);
         td.innerHTML = '<ul class="utterance-list">' +
-          utts.map(u =>
-            '<li><span class="utt-time">'+fmtMs(u.start)+'</span>' +
-            '<span class="utt-speaker">Speaker '+esc(u.speaker)+'</span>' +
-            esc(u.text.substring(0,200)) + (u.text.length>200?'...':'') + '</li>'
-          ).join('') +
+          utts.map(u => {{
+            // Show resolved name if available, otherwise "Speaker X"
+            const spk = (u.speaker && u.speaker.length > 1) ? esc(u.speaker) : 'Speaker '+esc(u.speaker);
+            return '<li><span class="utt-time">'+fmtMs(u.start)+'</span>' +
+            '<span class="utt-speaker">'+spk+'</span>' +
+            esc(u.text.substring(0,200)) + (u.text.length>200?'...':'') + '</li>';
+          }}).join('') +
           '</ul>' +
           (t.utterances.length > 15 ? '<div style="font-size:0.8rem;color:#6b7280;margin-top:8px">...and '+(t.utterances.length-15)+' more utterances</div>' : '');
         previewRow.appendChild(td);
@@ -1069,7 +1077,8 @@ function doGlobalSearch(query) {{
           '<div class="sr-context">';
         h.matches.forEach(u => {{
           const snippet = highlightSnippet(u.text, query, 80) || esc(u.text.substring(0, 160));
-          html += '<div style="margin-bottom:4px"><span class="utt-time">' + fmtMs(u.start) + '</span> <span class="utt-speaker">Speaker ' + esc(u.speaker) + '</span> ' + snippet + '</div>';
+          const spk = (u.speaker && u.speaker.length > 1) ? esc(u.speaker) : 'Speaker '+esc(u.speaker);
+          html += '<div style="margin-bottom:4px"><span class="utt-time">' + fmtMs(u.start) + '</span> <span class="utt-speaker">' + spk + '</span> ' + snippet + '</div>';
         }});
         html += '</div></div>';
       }});

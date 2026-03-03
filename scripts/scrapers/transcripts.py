@@ -196,6 +196,28 @@ def resolve_speakers(transcript_data, members):
         # If absent response, just skip (don't map)
 
     # --- Heuristic 3: Self-Identification (members and non-members) ---
+    # Common words that ASR capitalizes but aren't names
+    _FALSE_POSITIVE_NAMES = {
+        # Gerunds/participles — ASR often capitalizes these mid-sentence
+        'going', 'making', 'looking', 'coming', 'getting', 'trying', 'saying',
+        'doing', 'having', 'being', 'taking', 'giving', 'asking', 'working',
+        'passing', 'scanning', 'thinking', 'running', 'moving', 'sitting',
+        'hoping', 'wondering', 'presenting', 'including', 'bringing', 'reading',
+        'showing', 'driving', 'planning', 'investigating', 'transcribing',
+        'assuming', 'hearing', 'missing', 'cutting', 'opening', 'telling',
+        'recommending', 'attempting', 'beginning', 'ending', 'starting',
+        'excited', 'willing', 'surprised', 'stumped', 'joking', 'hesitant',
+        'aware', 'unsure',
+        # Common short words
+        'not', 'now', 'here', 'there', 'sure', 'very', 'more', 'much',
+        'still', 'also', 'just', 'really', 'sorry', 'happy', 'glad', 'good',
+        'probably', 'certainly', 'actually', 'absolutely', 'obviously',
+        'somewhat', 'apparently',
+        # Prepositions/articles/conjunctions
+        'the', 'this', 'that', 'what', 'when', 'where', 'which', 'while',
+        'with', 'from', 'into', 'about', 'over', 'than', 'most', 'some',
+        'full', 'page', 'on',
+    }
     self_id_patterns = [
         re.compile(r'\bmy\s+name\s+is\s+([A-Z][a-z]+)\s+([A-Z][a-z]+(?:-[A-Z][a-z]+)?)', re.IGNORECASE),
         re.compile(r"\bI'?m\s+([A-Z][a-z]+)\s+([A-Z][a-z]+(?:-[A-Z][a-z]+)?)", re.IGNORECASE),
@@ -210,6 +232,11 @@ def resolve_speakers(transcript_data, members):
                 continue
             first_name = match.group(1)
             last_name_found = match.group(2)
+
+            # Skip common false-positive words from ASR capitalization
+            if first_name.lower() in _FALSE_POSITIVE_NAMES or last_name_found.lower() in _FALSE_POSITIVE_NAMES:
+                continue
+
             last_lower = last_name_found.lower()
 
             # Try member match first (members always win, weight +4)
@@ -331,16 +358,77 @@ def resolve_speakers(transcript_data, members):
                         member_evidence[matched][utterances[j]['speaker']] += 1
                         break
 
+    # --- Heuristic 5: "Ms./Mr./Miss LastName" staff pattern ---
+    # JBC transcripts use "Ms. Curry", "Ms. Green" for staff. When the chair
+    # says a formal name and the next speaker starts with "Thank you, Madam Chair",
+    # credit that speaker.
+    honorific_pattern = re.compile(
+        r'\b(?:Ms\.|Mr\.|Mrs\.|Miss)\s+([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\b'
+    )
+    for i, utt in enumerate(utterances):
+        text = utt.get('text', '')
+        speaker = utt['speaker']
+
+        # Only check chair's utterances for staff introductions
+        if chair_label and speaker == chair_label:
+            # Look at last 200 chars for honorific + name
+            tail = text[-200:] if len(text) > 200 else text
+            hon_matches = honorific_pattern.findall(tail)
+            if hon_matches:
+                called_name = hon_matches[-1].lower()
+                # Check if it's a member
+                matched = None
+                if called_name in last_names:
+                    matched = called_name
+                else:
+                    fuzzy = get_close_matches(called_name, all_last_names, n=1, cutoff=0.7)
+                    if fuzzy:
+                        matched = fuzzy[0]
+                if matched:
+                    # Credit next different speaker
+                    for j in range(i + 1, len(utterances)):
+                        if utterances[j]['speaker'] != speaker:
+                            member_evidence[matched][utterances[j]['speaker']] += 1
+                            break
+
+    # --- Heuristic 6: Utterance-start name tag ---
+    # AssemblyAI sometimes prepends the speaker's name at the start of their
+    # utterance (e.g., "Taggart. Thank you, Madam Chair..."). If the first word
+    # is a recognized last name followed by a period, credit that speaker.
+    for utt in utterances:
+        text = utt.get('text', '').strip()
+        speaker = utt['speaker']
+        if not text or len(text) < 3:
+            continue
+        # Match: "LastName. <rest of text>"
+        tag_match = re.match(r'^([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\.\s', text)
+        if not tag_match:
+            continue
+        tag_name = tag_match.group(1).lower()
+        matched = None
+        if tag_name in last_names:
+            matched = tag_name
+        else:
+            fuzzy = get_close_matches(tag_name, all_last_names, n=1, cutoff=0.8)
+            if fuzzy:
+                matched = fuzzy[0]
+        if matched:
+            member_evidence[matched][speaker] += 3
+
     # --- Assign members to speaker labels ---
     # For each member with evidence, find best speaker label
+    # Lower evidence threshold for high speaker count relative to committee size
+    unique_speakers = set(u.get('speaker', '') for u in utterances)
+    min_evidence = 1 if len(unique_speakers) >= 7 else 2
+
     assignments = []  # [(member_last_name, speaker_label, evidence_count)]
     for member_name, label_counts in member_evidence.items():
         if not label_counts:
             continue
         best_label, best_count = label_counts.most_common(1)[0]
         total = sum(label_counts.values())
-        # Require minimum 2 evidence points and >50% majority
-        if best_count >= 2 and best_count > total * 0.5:
+        # Require minimum evidence points and >50% majority
+        if best_count >= min_evidence and best_count > total * 0.5:
             assignments.append((member_name, best_label, best_count))
 
     # Sort by evidence (highest first) for dedup
@@ -386,6 +474,37 @@ def resolve_speakers(transcript_data, members):
     for label, info in nonmember_map.items():
         if label not in speaker_map:
             speaker_map[label] = info
+
+    return speaker_map
+
+
+def resolve_and_store_speakers(clip_id, committee_name, members, cache_manager):
+    """
+    Resolve speaker labels to real names and persist results in the transcript JSON.
+
+    Args:
+        clip_id: Clip ID of the transcript
+        committee_name: Committee name used for resolution (for audit)
+        members: List of member dicts from get_committee_info()
+        cache_manager: CacheManager instance
+
+    Returns:
+        dict: speaker_map {label: {"name": ..., "display": ..., "evidence": N}},
+              or empty dict if no transcript found
+    """
+    transcript = get_transcript(clip_id, cache_manager)
+    if not transcript or transcript.get('error'):
+        return {}
+
+    speaker_map = resolve_speakers(transcript, members)
+
+    # Store resolution results back into the transcript
+    transcript['speaker_map'] = speaker_map
+    transcript['speaker_map_committee'] = committee_name
+
+    # Write back to cache
+    cache_key = f"transcript_{clip_id}"
+    cache_manager.set(cache_key, transcript, subdirectory='transcripts')
 
     return speaker_map
 
