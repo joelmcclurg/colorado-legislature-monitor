@@ -906,9 +906,11 @@ function renderHearings() {{
         td.innerHTML = '<ul class="utterance-list">' +
           utts.map(u => {{
             // Show resolved name if available, otherwise "Speaker X"
-            const spk = (u.speaker && u.speaker.length > 1) ? esc(u.speaker) : 'Speaker '+esc(u.speaker);
-            return '<li><span class="utt-time">'+fmtMs(u.start)+'</span>' +
-            '<span class="utt-speaker">'+spk+'</span>' +
+            const spk = (u.speaker && u.speaker.length > 1 && u.speaker !== '?') ? esc(u.speaker) : '';
+            const spkHtml = spk ? '<span class="utt-speaker">'+spk+'</span>' : '';
+            const timeStr = u.start > 0 ? fmtMs(u.start) : '';
+            const timeHtml = timeStr ? '<span class="utt-time">'+timeStr+'</span>' : '';
+            return '<li>'+timeHtml+spkHtml+
             esc(u.text.substring(0,200)) + (u.text.length>200?'...':'') + '</li>';
           }}).join('') +
           '</ul>' +
@@ -1077,8 +1079,11 @@ function doGlobalSearch(query) {{
           '<div class="sr-context">';
         h.matches.forEach(u => {{
           const snippet = highlightSnippet(u.text, query, 80) || esc(u.text.substring(0, 160));
-          const spk = (u.speaker && u.speaker.length > 1) ? esc(u.speaker) : 'Speaker '+esc(u.speaker);
-          html += '<div style="margin-bottom:4px"><span class="utt-time">' + fmtMs(u.start) + '</span> <span class="utt-speaker">' + spk + '</span> ' + snippet + '</div>';
+          const spk = (u.speaker && u.speaker.length > 1 && u.speaker !== '?') ? esc(u.speaker) : '';
+          const spkHtml = spk ? '<span class="utt-speaker">' + spk + '</span> ' : '';
+          const timeStr = u.start > 0 ? fmtMs(u.start) : '';
+          const timeHtml = timeStr ? '<span class="utt-time">' + timeStr + '</span> ' : '';
+          html += '<div style="margin-bottom:4px">' + timeHtml + spkHtml + snippet + '</div>';
         }});
         html += '</div></div>';
       }});

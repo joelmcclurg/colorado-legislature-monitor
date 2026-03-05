@@ -257,7 +257,7 @@ footer a{color:#6b7280}
 <footer>
   Data from <a href="https://leg.colorado.gov" target="_blank" rel="noopener">leg.colorado.gov</a>
   &amp; <a href="https://sg001-harmony.sliq.net" target="_blank" rel="noopener">SLIQ</a> &middot;
-  Last updated March 05, 2026 at 11:29 AM &middot;
+  Last updated March 05, 2026 at 11:44 AM &middot;
   Built with <a href="https://github.com/joelmcclurg/colorado-legislature-monitor" target="_blank" rel="noopener">Colorado Legislature Monitor</a>
 </footer>
 
@@ -496,9 +496,11 @@ function renderHearings() {
         td.innerHTML = '<ul class="utterance-list">' +
           utts.map(u => {
             // Show resolved name if available, otherwise "Speaker X"
-            const spk = (u.speaker && u.speaker.length > 1) ? esc(u.speaker) : 'Speaker '+esc(u.speaker);
-            return '<li><span class="utt-time">'+fmtMs(u.start)+'</span>' +
-            '<span class="utt-speaker">'+spk+'</span>' +
+            const spk = (u.speaker && u.speaker.length > 1 && u.speaker !== '?') ? esc(u.speaker) : '';
+            const spkHtml = spk ? '<span class="utt-speaker">'+spk+'</span>' : '';
+            const timeStr = u.start > 0 ? fmtMs(u.start) : '';
+            const timeHtml = timeStr ? '<span class="utt-time">'+timeStr+'</span>' : '';
+            return '<li>'+timeHtml+spkHtml+
             esc(u.text.substring(0,200)) + (u.text.length>200?'...':'') + '</li>';
           }).join('') +
           '</ul>' +
@@ -667,8 +669,11 @@ function doGlobalSearch(query) {
           '<div class="sr-context">';
         h.matches.forEach(u => {
           const snippet = highlightSnippet(u.text, query, 80) || esc(u.text.substring(0, 160));
-          const spk = (u.speaker && u.speaker.length > 1) ? esc(u.speaker) : 'Speaker '+esc(u.speaker);
-          html += '<div style="margin-bottom:4px"><span class="utt-time">' + fmtMs(u.start) + '</span> <span class="utt-speaker">' + spk + '</span> ' + snippet + '</div>';
+          const spk = (u.speaker && u.speaker.length > 1 && u.speaker !== '?') ? esc(u.speaker) : '';
+          const spkHtml = spk ? '<span class="utt-speaker">' + spk + '</span> ' : '';
+          const timeStr = u.start > 0 ? fmtMs(u.start) : '';
+          const timeHtml = timeStr ? '<span class="utt-time">' + timeStr + '</span> ' : '';
+          html += '<div style="margin-bottom:4px">' + timeHtml + spkHtml + snippet + '</div>';
         });
         html += '</div></div>';
       });
