@@ -206,17 +206,25 @@ def resolve_speakers(transcript_data, members):
         'showing', 'driving', 'planning', 'investigating', 'transcribing',
         'assuming', 'hearing', 'missing', 'cutting', 'opening', 'telling',
         'recommending', 'attempting', 'beginning', 'ending', 'starting',
+        'highlighting', 'proposing', 'discontinuing', 'prepared', 'inclined',
+        'opposed', 'wanting', 'ready', 'scrolling', 'dredging', 'recalling',
+        'forgetting', 'discussing', 'restarting', 'struggling', 'interested',
+        'gonna', 'behind', 'fine', 'longer', 'skip',
         'excited', 'willing', 'surprised', 'stumped', 'joking', 'hesitant',
-        'aware', 'unsure',
+        'aware', 'unsure', 'open', 'simply', 'therefore', 'either', 'like',
+        # JBC budget hearing terms (often after "I'm recommending...")
+        'approval', 'denial', 'sort', 'an', 'to', 'for', 'of', 'it', 'is',
         # Common short words
         'not', 'now', 'here', 'there', 'sure', 'very', 'more', 'much',
         'still', 'also', 'just', 'really', 'sorry', 'happy', 'glad', 'good',
         'probably', 'certainly', 'actually', 'absolutely', 'obviously',
-        'somewhat', 'apparently',
+        'somewhat', 'apparently', 'so', 'at', 'no', 'if', 'do', 'my',
         # Prepositions/articles/conjunctions
         'the', 'this', 'that', 'what', 'when', 'where', 'which', 'while',
         'with', 'from', 'into', 'about', 'over', 'than', 'most', 'some',
-        'full', 'page', 'on',
+        'full', 'page', 'on', 'because', 'through', 'right', 'correctly',
+        # Titles/honorifics (not names)
+        'madam', 'chair', 'senator', 'representative', 'mister', 'miss',
     }
     self_id_patterns = [
         re.compile(r'\bmy\s+name\s+is\s+([A-Z][a-z]+)\s+([A-Z][a-z]+(?:-[A-Z][a-z]+)?)', re.IGNORECASE),
@@ -237,6 +245,11 @@ def resolve_speakers(transcript_data, members):
             if first_name.lower() in _FALSE_POSITIVE_NAMES or last_name_found.lower() in _FALSE_POSITIVE_NAMES:
                 continue
 
+            # Both parts must be capitalized in the original text (proper nouns)
+            # IGNORECASE matches lowercase words, so verify ASR actually capitalized them
+            if not first_name[0].isupper() or not last_name_found[0].isupper():
+                continue
+
             last_lower = last_name_found.lower()
 
             # Try member match first (members always win, weight +4)
@@ -254,6 +267,9 @@ def resolve_speakers(transcript_data, members):
             # Non-member: capture name + try to extract title/org
             if speaker not in nonmember_map:
                 full_name = f"{first_name} {last_name_found}"
+                # Skip if either part is too short (likely not a real name)
+                if len(first_name) < 3 or len(last_name_found) < 3:
+                    continue
                 title = None
                 # Extract title: ", [title]." after the name
                 after_name = text[match.end():]
@@ -265,6 +281,9 @@ def resolve_speakers(transcript_data, members):
                         title = title_match2.group(1).strip()
                 else:
                     title = title_match.group(1).strip()
+                # Cap title length to avoid capturing long quotes
+                if title and len(title) > 80:
+                    title = None
                 display = f"{full_name} ({title})" if title else full_name
                 nonmember_map[speaker] = {
                     'name': full_name,
@@ -289,6 +308,11 @@ def resolve_speakers(transcript_data, members):
         first_name = match.group(1)
         last_name_found = match.group(2)
         title = match.group(3).strip()
+
+        # Skip common false-positive words (same filter as self-ID)
+        if first_name.lower() in _FALSE_POSITIVE_NAMES or last_name_found.lower() in _FALSE_POSITIVE_NAMES:
+            continue
+
         last_lower = last_name_found.lower()
 
         # Skip if last name matches a committee member
